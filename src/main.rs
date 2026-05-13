@@ -1,25 +1,40 @@
 // prelude
 //
-// Peios initramfs PID 1. Mounts /proc /sys /dev, walks the hook list at
-// /etc/prelude/hooks, then drops to /bin/sh. switch_root lands later
-// (M1 step 5 of boot-design.md).
+// Peios initramfs PID 1. Hardcoded monolithic boot pipeline for Goal One:
+// mount kernel virtual filesystems, mount the baked-in squashfs as the new
+// root, switch_root, exec the real PID 1.
 //
-// Built static against musl. No external crates: keeps the boot artifact
-// auditable and the build trivial. std is used where it's already there
-// (fs, process::Command, io); raw libc FFI covers the syscalls std
-// doesn't expose (mount, reboot, sync, execve).
+// No hooks, no DAG, no external crates. Once peinitramfs and the real DAG
+// land we'll grow this into a hook walker. For now the goal is end-to-end
+// validation of switch_root mechanics with the smallest possible prelude.
+//
+// Built static against musl. std for fs/io/env/process; raw libc FFI for the
+// syscalls std doesn't expose (mount, chroot, reboot, execve, sync).
 
 #![allow(clippy::missing_safety_doc)]
 
-use core::ffi::{c_int, c_ulong};
+use core::ffi::{c_int, c_long, c_ulong};
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::process::Command;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
+const MS_RDONLY: c_ulong = 1;
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
 const MS_NOEXEC: c_ulong = 8;
+const MS_REC: c_ulong = 16384;
+const MS_MOVE: c_ulong = 8192;
+const MS_PRIVATE: c_ulong = 1 << 18;
+
+const O_RDONLY: c_int = 0;
+const O_RDWR: c_int = 2;
+
+// Loop ioctls. Numbers stable across architectures (no _IO macros needed —
+// these are plain bit constants).
+const LOOP_SET_FD: c_ulong = 0x4C00;
+const LOOP_CTL_GET_FREE: c_ulong = 0x4C82;
 
 extern "C" {
     fn mount(
@@ -30,35 +45,23 @@ extern "C" {
         data: *const u8,
     ) -> c_int;
     fn mkdir(path: *const u8, mode: u32) -> c_int;
+    fn chroot(path: *const u8) -> c_int;
+    fn chdir(path: *const u8) -> c_int;
     fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     fn reboot(cmd: c_int) -> c_int;
     fn sync();
+    fn open(path: *const u8, flags: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, arg: c_long) -> c_int;
 }
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
-const HOOK_LIST_PATH: &str = "/etc/prelude/hooks";
+const SYSROOT: &str = "/sysroot";
+const SYSROOT_IMG: &str = "/sysroot.squashfs";
+const FALLBACK_INITS: &[&str] = &["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
 
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("nul in string")
-}
-
-fn try_mount(source: &str, target: &str, fstype: &str, flags: c_ulong) {
-    let s = cstr(source);
-    let t = cstr(target);
-    let f = cstr(fstype);
-    let rc = unsafe {
-        mount(
-            s.as_ptr() as *const u8,
-            t.as_ptr() as *const u8,
-            f.as_ptr() as *const u8,
-            flags,
-            core::ptr::null(),
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        eprintln!("prelude: mount {target} ({fstype}) failed: {err}");
-    }
 }
 
 fn try_mkdir(path: &str) {
@@ -68,12 +71,40 @@ fn try_mkdir(path: &str) {
     }
 }
 
+fn do_mount(
+    source: &str,
+    target: &str,
+    fstype: Option<&str>,
+    flags: c_ulong,
+    data: Option<&str>,
+) -> std::io::Result<()> {
+    let s = cstr(source);
+    let t = cstr(target);
+    let f = fstype.map(cstr);
+    let d = data.map(cstr);
+    let f_ptr = f.as_ref().map_or(core::ptr::null(), |c| c.as_ptr() as *const u8);
+    let d_ptr = d.as_ref().map_or(core::ptr::null(), |c| c.as_ptr() as *const u8);
+    let rc = unsafe {
+        mount(
+            s.as_ptr() as *const u8,
+            t.as_ptr() as *const u8,
+            f_ptr,
+            flags,
+            d_ptr,
+        )
+    };
+    if rc != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn banner() {
     let lines = [
         "",
         "  ============================================",
         "   prelude  (initramfs PID 1, v0.0.1)",
-        "   walks hooks, then hands off",
         "  ============================================",
         "",
     ];
@@ -84,84 +115,222 @@ fn banner() {
     let _ = out.flush();
 }
 
-struct Hook {
-    name: String,
-    path: String,
+fn log(msg: &str) {
+    eprintln!("prelude: {msg}");
 }
 
-fn parse_hooks(contents: &str) -> Vec<Hook> {
-    let mut hooks = Vec::new();
-    for (lineno, raw) in contents.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let name = parts.next().unwrap_or("").trim();
-        let path = parts.next().map(|p| p.trim()).unwrap_or("");
-        if name.is_empty() || path.is_empty() {
-            eprintln!(
-                "prelude: malformed hook line {} (expected '<name> <path>'): {raw:?}",
-                lineno + 1
-            );
-            continue;
-        }
-        hooks.push(Hook {
-            name: name.to_string(),
-            path: path.to_string(),
-        });
+// Attach `backing_path` to a free loop device. Returns the loop device
+// path (e.g. "/dev/loop0"). On error the caller should drop to halt;
+// we don't bother cleaning up partial state because PID 1 is about to die.
+fn setup_loop(backing_path: &str) -> std::io::Result<String> {
+    let ctl_path = cstr("/dev/loop-control");
+    let ctl_fd = unsafe { open(ctl_path.as_ptr() as *const u8, O_RDWR) };
+    if ctl_fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    hooks
+    let loop_n = unsafe { ioctl(ctl_fd, LOOP_CTL_GET_FREE, 0) };
+    unsafe { close(ctl_fd) };
+    if loop_n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let loop_dev = format!("/dev/loop{loop_n}");
+    let loop_c = cstr(&loop_dev);
+    let loop_fd = unsafe { open(loop_c.as_ptr() as *const u8, O_RDWR) };
+    if loop_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let backing_c = cstr(backing_path);
+    let backing_fd = unsafe { open(backing_c.as_ptr() as *const u8, O_RDONLY) };
+    if backing_fd < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { close(loop_fd) };
+        return Err(e);
+    }
+
+    let rc = unsafe { ioctl(loop_fd, LOOP_SET_FD, backing_fd as c_long) };
+    unsafe { close(backing_fd) };
+    unsafe { close(loop_fd) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(loop_dev)
 }
 
-fn run_hooks() -> Result<(), String> {
-    let contents = match fs::read_to_string(HOOK_LIST_PATH) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("prelude: no hook list at {HOOK_LIST_PATH}; nothing to run");
-            return Ok(());
+// Returns the init= value from /proc/cmdline if present.
+fn cmdline_init() -> Option<String> {
+    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+    for tok in cmdline.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("init=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
         }
-        Err(e) => return Err(format!("could not read {HOOK_LIST_PATH}: {e}")),
+    }
+    None
+}
+
+// Recursively delete everything under `path` that lives on the rootfs's
+// device. Mount points (different st_dev) are left alone — that's how
+// /proc, /sys, /dev, and /sysroot survive the walk. `path` itself is not
+// removed; only its contents.
+fn cleanup_old_root(root_dev: u64, path: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(path) {
+        Ok(it) => it,
+        Err(e) => return Err(e),
     };
-
-    let hooks = parse_hooks(&contents);
-    if hooks.is_empty() {
-        eprintln!("prelude: hook list is empty; nothing to run");
-        return Ok(());
-    }
-
-    for hook in &hooks {
-        eprintln!("prelude: running hook {} ({})", hook.name, hook.path);
-        let status = match Command::new(&hook.path).status() {
-            Ok(s) => s,
-            Err(e) => return Err(format!("hook {}: spawn failed: {e}", hook.name)),
+    for entry in entries {
+        let entry = entry?;
+        let p = entry.path();
+        let md = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
-        if !status.success() {
-            let how = match status.code() {
-                Some(c) => format!("exit {c}"),
-                None => "killed by signal".to_string(),
-            };
-            return Err(format!("hook {}: {how}", hook.name));
+        if md.dev() != root_dev {
+            continue;
+        }
+        if md.file_type().is_dir() {
+            if let Err(e) = cleanup_old_root(root_dev, &p) {
+                log(&format!("cleanup: descend {} failed: {e}", p.display()));
+            }
+            if let Err(e) = fs::remove_dir(&p) {
+                log(&format!("cleanup: rmdir {} failed: {e}", p.display()));
+            }
+        } else if let Err(e) = fs::remove_file(&p) {
+            log(&format!("cleanup: unlink {} failed: {e}", p.display()));
         }
     }
     Ok(())
 }
 
-fn drop_to_shell() -> ! {
-    let shell = cstr("/bin/sh");
-    let arg0 = cstr("sh");
-    let argv: [*const u8; 2] = [arg0.as_ptr() as *const u8, core::ptr::null()];
+// The real work. Returns only on failure — success exits via execve.
+fn boot() -> std::io::Result<()> {
+    // Phase 0: make the rootfs and all descendant mounts private so that
+    // mount-move (phase 4) and the root pivot (phase 6) aren't blocked by
+    // shared-mount propagation. Modern kernels default new mounts to shared
+    // namespace propagation, which makes MS_MOVE return EACCES on mounts
+    // marked shared.
+    do_mount("none", "/", None, MS_REC | MS_PRIVATE, None)?;
+
+    // Phase 1: kernel virtual filesystems.
+    try_mkdir("/proc");
+    try_mkdir("/sys");
+    try_mkdir("/dev");
+    do_mount("proc", "/proc", Some("proc"), MS_NOSUID | MS_NOEXEC | MS_NODEV, None)?;
+    do_mount("sysfs", "/sys", Some("sysfs"), MS_NOSUID | MS_NOEXEC | MS_NODEV, None)?;
+    do_mount("devtmpfs", "/dev", Some("devtmpfs"), MS_NOSUID, None)?;
+
+    banner();
+
+    // Phase 2: figure out the target init.
+    let target_init = match cmdline_init() {
+        Some(v) => {
+            log(&format!("target init from cmdline: {v}"));
+            v
+        }
+        None => {
+            log("no init= on cmdline; will try fallback chain on the new root");
+            String::new()
+        }
+    };
+
+    // Phase 3: mount the squashfs new root.
+    if !Path::new(SYSROOT_IMG).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no {SYSROOT_IMG} in initramfs"),
+        ));
+    }
+    try_mkdir(SYSROOT);
+    let loop_dev = setup_loop(SYSROOT_IMG)?;
+    log(&format!("loop: {SYSROOT_IMG} -> {loop_dev}"));
+    do_mount(&loop_dev, SYSROOT, Some("squashfs"), MS_RDONLY, None)?;
+    log(&format!("mounted {loop_dev} at {SYSROOT}"));
+
+    // Phase 4: move kernel vfs into the new root so the new PID 1 has them.
+    // The squashfs is RO and must ship /proc, /sys, /dev as empty
+    // mountpoint dirs — build-sysroot-squashfs.sh creates them.
+    for sub in &["proc", "sys", "dev"] {
+        let from = format!("/{sub}");
+        let to = format!("{SYSROOT}/{sub}");
+        log(&format!("mount-move {from} -> {to}"));
+        do_mount(&from, &to, None, MS_MOVE, None).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("mount-move {from}: {e}"))
+        })?;
+    }
+
+    // Phase 5: cleanup the old rootfs. Walks rootfs's st_dev only; the
+    // moved mounts and /sysroot all have different st_devs and stay put.
+    let root_dev = fs::metadata("/")?.dev();
+    if let Err(e) = cleanup_old_root(root_dev, Path::new("/")) {
+        log(&format!("cleanup: {e} (continuing)"));
+    }
+
+    // Phase 6: chroot into the new root. We don't mount-move the squashfs
+    // over the rootfs (`mount(".", "/", MS_MOVE)`) because the kernel
+    // disallows moving onto the rootfs. pivot_root has the same constraint.
+    // chroot is sufficient for Goal One: PID 1 and all descendants see the
+    // squashfs as /. The kernel's "real" rootfs is unreachable but still
+    // exists as a namespace bookkeeping artifact (empty after phase 5).
+    log("pivot: chdir sysroot");
+    let sysroot_c = cstr(SYSROOT);
+    let slash_c = cstr("/");
+    unsafe {
+        if chdir(sysroot_c.as_ptr() as *const u8) != 0 {
+            return Err(std::io::Error::new(std::io::Error::last_os_error().kind(),
+                format!("chdir({SYSROOT}): {}", std::io::Error::last_os_error())));
+        }
+        log("pivot: chroot");
+        if chroot(sysroot_c.as_ptr() as *const u8) != 0 {
+            return Err(std::io::Error::new(std::io::Error::last_os_error().kind(),
+                format!("chroot({SYSROOT}): {}", std::io::Error::last_os_error())));
+        }
+        log("pivot: chdir /");
+        if chdir(slash_c.as_ptr() as *const u8) != 0 {
+            return Err(std::io::Error::new(std::io::Error::last_os_error().kind(),
+                format!("chdir(/): {}", std::io::Error::last_os_error())));
+        }
+    }
+
+    // Phase 7: exec the real PID 1. Try cmdline init= first, then the
+    // kernel's own fallback chain (/sbin/init, /etc/init, /bin/init, /bin/sh).
+    let candidates: Vec<&str> = if !target_init.is_empty() {
+        let mut v = Vec::with_capacity(FALLBACK_INITS.len() + 1);
+        v.push(target_init.as_str());
+        v.extend_from_slice(FALLBACK_INITS);
+        v
+    } else {
+        FALLBACK_INITS.to_vec()
+    };
+
     let term = cstr("TERM=linux");
     let envp: [*const u8; 2] = [term.as_ptr() as *const u8, core::ptr::null()];
 
-    let rc = unsafe { execve(shell.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
-    let err = std::io::Error::last_os_error();
-    eprintln!("prelude: execve /bin/sh failed (rc={rc}): {err}");
-    halt();
+    for path in &candidates {
+        if !Path::new(path).exists() {
+            log(&format!("skip {path}: not present"));
+            continue;
+        }
+        log(&format!("exec {path}"));
+        let pc = cstr(path);
+        let arg0 = cstr(path);
+        let argv: [*const u8; 2] = [arg0.as_ptr() as *const u8, core::ptr::null()];
+        unsafe {
+            execve(pc.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr());
+        }
+        log(&format!("execve {path} failed: {}", std::io::Error::last_os_error()));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no init candidate executable",
+    ))
 }
 
 fn halt() -> ! {
-    eprintln!("prelude: halting");
+    log("halting system");
     unsafe {
         sync();
         reboot(RB_HALT_SYSTEM);
@@ -172,23 +341,8 @@ fn halt() -> ! {
 }
 
 fn main() {
-    try_mkdir("/proc");
-    try_mkdir("/sys");
-    try_mkdir("/dev");
-
-    try_mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV);
-    try_mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV);
-    try_mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID);
-
-    banner();
-
-    if let Err(reason) = run_hooks() {
-        eprintln!("prelude: hook execution failed: {reason}");
-        eprintln!("prelude: dropping to shell for debug");
+    if let Err(e) = boot() {
+        log(&format!("boot failed: {e}"));
     }
-
-    // No switch_root yet (M1 step 5). After hooks run, drop to a shell.
-    // Makes prelude a drop-in replacement for protoinit in kobicha-style
-    // permanent-initramfs setups.
-    drop_to_shell();
+    halt();
 }
