@@ -2,49 +2,36 @@
 
 Peios's initramfs PID 1.
 
-prelude is the first userspace process the kernel executes after unpacking
-the initramfs. Its job:
-
-1. Mount the core virtual filesystems (`/proc`, `/sys`, `/dev`).
-2. Walk an ordered list of hooks baked into the initramfs by `peinitramfs`
-   (the builder, separate project). Each hook does one concrete thing —
-   load modules, unlock crypto, activate volumes, mount the real root.
-3. `switch_root` into the real root filesystem and `exec` the real PID 1.
+The kernel unpacks the initramfs into a rootfs tmpfs and execs `/init`.
+That's prelude. Its job is to get userspace from "the kernel just unpacked
+me into RAM" to "the real root is mounted and the real PID 1 is running."
 
 prelude is *not* `peinit`. `peinit` is the real-root PID 1: registry-driven
 service supervision, jobs, operations, never exits. prelude is the prologue
-that gets userspace from "kernel just unpacked initramfs" to "real root is
-mounted, run the real init." Different lifecycles, different concerns, two
-separate binaries.
+that gets us there. Different lifecycles, two separate binaries.
 
-## Status
+## What it does (Goal One)
 
-Bootstrap. Implements early mounts and the hook walker. No `switch_root`
-yet — that lands when the first real-boot pathway is wired up (M1 step 5
-in the boot-stack design doc). Today prelude drops to `/bin/sh` after the
-hook list completes, which makes it a drop-in replacement for `protoinit`
-in kobicha-style permanent-initramfs setups.
+For Goal One the boot pipeline is a monolithic hardcoded sequence — no
+hooks, no DAG, no configuration. Once `peinitramfs` and the real hook DAG
+land we'll grow this into a hook walker.
 
-## Hook list format
+1. Mount `/proc`, `/sys`, `/dev`.
+2. Read `/proc/cmdline`, look for `init=…`.
+3. Mount `/sysroot.squashfs` (baked into the initramfs) as squashfs+loop
+   at `/sysroot`.
+4. Move the `/proc`, `/sys`, `/dev` mounts from the rootfs into `/sysroot`.
+5. Cleanup: recursively delete everything on the rootfs's device. Mount
+   points (different `st_dev`) — `/sysroot`, the moved kernel vfs — are
+   automatically skipped.
+6. `chdir /sysroot` → `mount --move . /` → `chroot .` → `chdir /`.
+7. Exec the real PID 1. Candidate order: cmdline `init=` first, then
+   `/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh` (the kernel's own
+   fallback chain).
 
-`/etc/prelude/hooks` is a plain-text file the initramfs builder writes.
-One hook per line:
-
-```
-<name> <absolute-path-to-executable>
-```
-
-Lines starting with `#` are comments. Blank lines are ignored. Order is
-the order of execution — the builder topologically sorts the hook DAG at
-build time so prelude can be a dumb sequential consumer.
-
-If the file is missing or empty, prelude drops to a shell. This is the
-intended behaviour for kobicha-style boots that have nothing to do before
-the user can start poking around.
-
-If a hook exits non-zero, prelude logs the failure to stderr and drops to
-a shell rather than aborting PID 1. The system stays interactive so the
-user can debug.
+On any failure: log, sync, halt. There is no `/bin/sh` in the initramfs
+to drop to — the initramfs only contains prelude and the squashfs. Debug
+via kernel log.
 
 ## Build
 
@@ -54,7 +41,7 @@ make
 
 Produces a static-musl-PIE binary at
 `target/x86_64-unknown-linux-musl/release/prelude`. No external crates;
-all syscalls go through `libc` FFI shims defined in `src/main.rs`.
+syscalls go through `libc` FFI shims defined in `src/main.rs`.
 
 The Makefile invokes the rustup-managed `cargo` directly rather than the
 ambient one — on NixOS the default `cargo` comes from a nix-wrapper that
@@ -64,4 +51,6 @@ can't find the musl rustlib even when the target is installed. Plain
 ## Where this fits
 
 Design context: `boot-design.md` in the parent `peios/` workspace.
-prelude is M1 step 2 of the boot-stack endgoal-C plan.
+prelude is M1 of the boot-stack endgoal-C plan. Goal One: get a kernel
+→ prelude → squashfs → protoinit → shell pipeline running end-to-end in
+QEMU.
