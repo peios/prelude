@@ -11,3 +11,7 @@ name = "mkirf"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
