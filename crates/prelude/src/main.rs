@@ -251,7 +251,7 @@ fn boot() -> std::io::Result<()> {
 
     // Phase 4: move kernel vfs into the new root so the new PID 1 has them.
     // The squashfs is RO and must ship /proc, /sys, /dev as empty
-    // mountpoint dirs — build-sysroot-squashfs.sh creates them.
+    // mountpoint dirs — build-staging.sh creates them.
     for sub in &["proc", "sys", "dev"] {
         let from = format!("/{sub}");
         let to = format!("{SYSROOT}/{sub}");
