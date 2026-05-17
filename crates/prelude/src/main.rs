@@ -3,12 +3,14 @@
 // Peios initramfs PID 1. Boot pipeline:
 //   - mount the kernel virtual filesystems
 //   - run the initramfs hooks, in the order mkirf baked into /hooks.seq
-//   - mount the baked-in squashfs as the new root
+//   - check a hook has mounted the real root at /sysroot
 //   - chroot into it and exec the real PID 1
 //
-// prelude does not resolve the hook DAG: mkirf does that at build time
-// and writes /hooks.seq; prelude reads the list and runs it in order.
-// See boot-design.md and crates/mkirf/DESIGN.md.
+// prelude is the invariant skeleton; everything deployment-specific is a
+// hook. Mounting the real root is a hook's job — prelude only provides
+// the /sysroot mountpoint and verifies the result. It does not resolve
+// the hook DAG either: mkirf does that at build time and writes
+// /hooks.seq; prelude reads the list and runs it. See boot-design.md.
 //
 // Built static against musl, no external crates. std for fs/io/env/
 // process; raw libc FFI for the syscalls std doesn't expose (mount,
@@ -16,28 +18,19 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use core::ffi::{c_int, c_long, c_ulong};
+use core::ffi::{c_int, c_ulong};
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-const MS_RDONLY: c_ulong = 1;
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
 const MS_NOEXEC: c_ulong = 8;
 const MS_REC: c_ulong = 16384;
 const MS_MOVE: c_ulong = 8192;
 const MS_PRIVATE: c_ulong = 1 << 18;
-
-const O_RDONLY: c_int = 0;
-const O_RDWR: c_int = 2;
-
-// Loop ioctls. Numbers stable across architectures (no _IO macros needed —
-// these are plain bit constants).
-const LOOP_SET_FD: c_ulong = 0x4C00;
-const LOOP_CTL_GET_FREE: c_ulong = 0x4C82;
 
 extern "C" {
     fn mount(
@@ -53,9 +46,6 @@ extern "C" {
     fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
     fn reboot(cmd: c_int) -> c_int;
     fn sync();
-    fn open(path: *const u8, flags: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
-    fn ioctl(fd: c_int, request: c_ulong, arg: c_long) -> c_int;
     fn fork() -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
@@ -63,7 +53,6 @@ extern "C" {
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
 const SYSROOT: &str = "/sysroot";
-const SYSROOT_IMG: &str = "/sysroot.squashfs";
 const FALLBACK_INITS: &[&str] = &["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
 
 // The hook manifest mkirf bakes into the initramfs: a version-marker
@@ -128,46 +117,6 @@ fn banner() {
 
 fn log(msg: &str) {
     eprintln!("prelude: {msg}");
-}
-
-// Attach `backing_path` to a free loop device. Returns the loop device
-// path (e.g. "/dev/loop0"). On error the caller should drop to halt;
-// we don't bother cleaning up partial state because PID 1 is about to die.
-fn setup_loop(backing_path: &str) -> std::io::Result<String> {
-    let ctl_path = cstr("/dev/loop-control");
-    let ctl_fd = unsafe { open(ctl_path.as_ptr() as *const u8, O_RDWR) };
-    if ctl_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let loop_n = unsafe { ioctl(ctl_fd, LOOP_CTL_GET_FREE, 0) };
-    unsafe { close(ctl_fd) };
-    if loop_n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let loop_dev = format!("/dev/loop{loop_n}");
-    let loop_c = cstr(&loop_dev);
-    let loop_fd = unsafe { open(loop_c.as_ptr() as *const u8, O_RDWR) };
-    if loop_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let backing_c = cstr(backing_path);
-    let backing_fd = unsafe { open(backing_c.as_ptr() as *const u8, O_RDONLY) };
-    if backing_fd < 0 {
-        let e = std::io::Error::last_os_error();
-        unsafe { close(loop_fd) };
-        return Err(e);
-    }
-
-    let rc = unsafe { ioctl(loop_fd, LOOP_SET_FD, backing_fd as c_long) };
-    unsafe { close(backing_fd) };
-    unsafe { close(loop_fd) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(loop_dev)
 }
 
 // Returns the init= value from /proc/cmdline if present.
@@ -264,7 +213,12 @@ fn run_one_hook(path: &str) -> std::io::Result<()> {
         let p = cstr(path);
         let argv: [*const u8; 2] = [p.as_ptr() as *const u8, core::ptr::null()];
         let term = cstr("TERM=linux");
-        let envp: [*const u8; 2] = [term.as_ptr() as *const u8, core::ptr::null()];
+        let path_env = cstr("PATH=/bin");
+        let envp: [*const u8; 3] = [
+            term.as_ptr() as *const u8,
+            path_env.as_ptr() as *const u8,
+            core::ptr::null(),
+        ];
         unsafe { execve(p.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
         log(&format!(
             "hook {path}: exec failed: {}",
@@ -330,22 +284,21 @@ fn boot() -> std::io::Result<()> {
     };
 
     // Phase 3: run the initramfs hooks. The kernel virtual filesystems
-    // are up — a hook may need them — and the real root is not mounted
-    // yet. mkirf resolved the order at build time; we just run the list.
+    // are up — a hook may need them. prelude provides an empty /sysroot
+    // mountpoint; mounting a real root onto it is a hook's job (the root
+    // filesystem varies by deployment, so it is never hardcoded here).
+    // mkirf resolved the hook order at build time; we just run the list.
+    try_mkdir(SYSROOT);
     run_hooks()?;
 
-    // Phase 4: mount the squashfs new root.
-    if !Path::new(SYSROOT_IMG).exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no {SYSROOT_IMG} in initramfs"),
-        ));
+    // Phase 4: a hook must have mounted the real root at /sysroot. If it
+    // is still on the initramfs's own device, nothing mounted it.
+    if fs::metadata(SYSROOT)?.dev() == fs::metadata("/")?.dev() {
+        return Err(std::io::Error::other(format!(
+            "no hook mounted a root filesystem at {SYSROOT}"
+        )));
     }
-    try_mkdir(SYSROOT);
-    let loop_dev = setup_loop(SYSROOT_IMG)?;
-    log(&format!("loop: {SYSROOT_IMG} -> {loop_dev}"));
-    do_mount(&loop_dev, SYSROOT, Some("squashfs"), MS_RDONLY, None)?;
-    log(&format!("mounted {loop_dev} at {SYSROOT}"));
+    log(&format!("root mounted at {SYSROOT}"));
 
     // Phase 5: move kernel vfs into the new root so the new PID 1 has them.
     // The squashfs is RO and must ship /proc, /sys, /dev as empty
