@@ -1,10 +1,13 @@
 //! End-to-end tests exercising the real `mkirf` binary.
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
+use flate2::read::GzDecoder;
 use tempfile::tempdir;
 
 /// Path to the `mkirf` binary, provided by Cargo to integration tests.
@@ -13,6 +16,7 @@ const MKIRF: &str = env!("CARGO_BIN_EXE_mkirf");
 fn sample_tree(root: &Path) {
     fs::create_dir_all(root.join("usr/bin")).unwrap();
     fs::write(root.join("init"), b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(root.join("init"), PermissionsExt::from_mode(0o755)).unwrap();
     fs::write(root.join("usr/bin/tool"), b"binary contents").unwrap();
 }
 
@@ -99,4 +103,109 @@ fn archive_extracts_with_gnu_cpio() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o111, 0o111, "executable bit survived the round trip");
+}
+
+/// Decompress a gzip blob to its raw bytes.
+fn gunzip(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    GzDecoder::new(bytes).read_to_end(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn hooks_seq_lists_hooks_in_dependency_order() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    sample_tree(&src);
+
+    // `a-consumer` requires the capability `z-producer` provides, so the
+    // resolved order must place the producer first — overriding the name
+    // order, which would otherwise put `a-consumer` first.
+    let hooks = src.join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    fs::write(
+        hooks.join("z-producer.sh"),
+        "#!/bin/sh\n# /// hook\n# provides = [\"ready\"]\n# ///\n",
+    )
+    .unwrap();
+    fs::write(
+        hooks.join("a-consumer.sh"),
+        "#!/bin/sh\n# /// hook\n# requires = [\"ready\"]\n# ///\n",
+    )
+    .unwrap();
+
+    let out = dir.path().join("initramfs.cpio.gz");
+    assert!(Command::new(MKIRF).arg(&src).arg(&out).status().unwrap().success());
+
+    // hooks.seq is stored uncompressed within the cpio; find its body in
+    // the decompressed archive.
+    let archive = gunzip(&fs::read(&out).unwrap());
+    let seq = b"hookseq 1\n/hooks/z-producer.sh\n/hooks/a-consumer.sh\n";
+    assert!(
+        archive.windows(seq.len()).any(|w| w == seq),
+        "hooks.seq not present in dependency order",
+    );
+}
+
+#[test]
+fn rejects_a_source_without_init() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("not-init"), b"x").unwrap();
+
+    let status = Command::new(MKIRF)
+        .arg(&src)
+        .arg(dir.path().join("out.cpio.gz"))
+        .status()
+        .unwrap();
+    assert!(!status.success(), "a source with no `init` must be rejected");
+}
+
+/// Poll `cond` until it returns true or `timeout` elapses.
+fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn watch_rebuilds_when_the_source_changes() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    sample_tree(&src);
+    let out = dir.path().join("initramfs.cpio.gz");
+
+    let mut child = Command::new(MKIRF)
+        .args(["--watch", "--debounce", "1"])
+        .arg(&src)
+        .arg(&out)
+        .spawn()
+        .unwrap();
+
+    // Watch mode builds once on startup.
+    let started = wait_for(Duration::from_secs(20), || out.exists());
+    let first = started.then(|| fs::read(&out).unwrap());
+
+    // A change to the source tree must trigger a rebuild.
+    fs::write(src.join("added-file"), b"new content").unwrap();
+    let rebuilt = match &first {
+        Some(first) => wait_for(Duration::from_secs(20), || {
+            fs::read(&out).map(|now| &now != first).unwrap_or(false)
+        }),
+        None => false,
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(started, "watch did not produce an initial build");
+    assert!(rebuilt, "watch did not rebuild after a source change");
 }
