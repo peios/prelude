@@ -1,15 +1,18 @@
 // prelude
 //
-// Peios initramfs PID 1. Hardcoded monolithic boot pipeline for Goal One:
-// mount kernel virtual filesystems, mount the baked-in squashfs as the new
-// root, switch_root, exec the real PID 1.
+// Peios initramfs PID 1. Boot pipeline:
+//   - mount the kernel virtual filesystems
+//   - run the initramfs hooks, in the order mkirf baked into /hooks.seq
+//   - mount the baked-in squashfs as the new root
+//   - chroot into it and exec the real PID 1
 //
-// No hooks, no DAG, no external crates. Once peinitramfs and the real DAG
-// land we'll grow this into a hook walker. For now the goal is end-to-end
-// validation of switch_root mechanics with the smallest possible prelude.
+// prelude does not resolve the hook DAG: mkirf does that at build time
+// and writes /hooks.seq; prelude reads the list and runs it in order.
+// See boot-design.md and crates/mkirf/DESIGN.md.
 //
-// Built static against musl. std for fs/io/env/process; raw libc FFI for the
-// syscalls std doesn't expose (mount, chroot, reboot, execve, sync).
+// Built static against musl, no external crates. std for fs/io/env/
+// process; raw libc FFI for the syscalls std doesn't expose (mount,
+// chroot, reboot, execve, fork, waitpid, sync).
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -53,12 +56,20 @@ extern "C" {
     fn open(path: *const u8, flags: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, arg: c_long) -> c_int;
+    fn fork() -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    fn _exit(status: c_int) -> !;
 }
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
 const SYSROOT: &str = "/sysroot";
 const SYSROOT_IMG: &str = "/sysroot.squashfs";
 const FALLBACK_INITS: &[&str] = &["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
+
+// The hook manifest mkirf bakes into the initramfs: a version-marker
+// line followed by the ordered hook paths.
+const HOOK_SEQ: &str = "/hooks.seq";
+const HOOK_SEQ_VERSION: &str = "hookseq 1";
 
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("nul in string")
@@ -177,10 +188,7 @@ fn cmdline_init() -> Option<String> {
 // /proc, /sys, /dev, and /sysroot survive the walk. `path` itself is not
 // removed; only its contents.
 fn cleanup_old_root(root_dev: u64, path: &Path) -> std::io::Result<()> {
-    let entries = match fs::read_dir(path) {
-        Ok(it) => it,
-        Err(e) => return Err(e),
-    };
+    let entries = fs::read_dir(path)?;
     for entry in entries {
         let entry = entry?;
         let p = entry.path();
@@ -205,10 +213,95 @@ fn cleanup_old_root(root_dev: u64, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+// Decode a `waitpid` status. `None` means the child exited cleanly;
+// `Some(reason)` describes how it failed.
+fn wait_failure(status: c_int) -> Option<String> {
+    let term_sig = status & 0x7f;
+    if term_sig == 0 {
+        let code = (status >> 8) & 0xff;
+        (code != 0).then(|| format!("exited with status {code}"))
+    } else if term_sig == 0x7f {
+        Some("stopped".to_string())
+    } else {
+        Some(format!("killed by signal {term_sig}"))
+    }
+}
+
+// Read /hooks.seq — the ordered hook list mkirf bakes into the
+// initramfs. A missing file means simply "no hooks"; a file whose
+// version marker is unrecognised is an error.
+fn read_hook_seq() -> std::io::Result<Vec<String>> {
+    let text = match fs::read_to_string(HOOK_SEQ) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log(&format!("{HOOK_SEQ}: not present; no hooks"));
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(HOOK_SEQ_VERSION) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "{HOOK_SEQ}: unrecognised version marker {other:?}"
+            )))
+        }
+    }
+    Ok(lines.filter(|l| !l.is_empty()).map(str::to_string).collect())
+}
+
+// Fork-exec one hook and wait for it. The hook is a script; the kernel
+// honours its `#!/bin/sh` shebang, so /bin/sh must exist in the
+// initramfs. A hook that does not exit 0 fails the boot.
+fn run_one_hook(path: &str) -> std::io::Result<()> {
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // Child: exec the hook and never fall back into prelude's pipeline.
+        let p = cstr(path);
+        let argv: [*const u8; 2] = [p.as_ptr() as *const u8, core::ptr::null()];
+        let term = cstr("TERM=linux");
+        let envp: [*const u8; 2] = [term.as_ptr() as *const u8, core::ptr::null()];
+        unsafe { execve(p.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
+        log(&format!(
+            "hook {path}: exec failed: {}",
+            std::io::Error::last_os_error(),
+        ));
+        unsafe { _exit(127) };
+    }
+    let mut status: c_int = 0;
+    if unsafe { waitpid(pid, &mut status, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    match wait_failure(status) {
+        None => Ok(()),
+        Some(reason) => Err(std::io::Error::other(format!("hook {path}: {reason}"))),
+    }
+}
+
+// Run every hook listed in /hooks.seq, in order. Called before the
+// real root is mounted; the kernel virtual filesystems are already up.
+fn run_hooks() -> std::io::Result<()> {
+    let hooks = read_hook_seq()?;
+    if hooks.is_empty() {
+        log("no hooks to run");
+        return Ok(());
+    }
+    for hook in &hooks {
+        log(&format!("hook: {hook}"));
+        run_one_hook(hook)?;
+    }
+    log(&format!("ran {} hook(s)", hooks.len()));
+    Ok(())
+}
+
 // The real work. Returns only on failure — success exits via execve.
 fn boot() -> std::io::Result<()> {
     // Phase 0: make the rootfs and all descendant mounts private so that
-    // mount-move (phase 4) and the root pivot (phase 6) aren't blocked by
+    // mount-move (phase 5) and the root pivot (phase 7) aren't blocked by
     // shared-mount propagation. Modern kernels default new mounts to shared
     // namespace propagation, which makes MS_MOVE return EACCES on mounts
     // marked shared.
@@ -236,7 +329,12 @@ fn boot() -> std::io::Result<()> {
         }
     };
 
-    // Phase 3: mount the squashfs new root.
+    // Phase 3: run the initramfs hooks. The kernel virtual filesystems
+    // are up — a hook may need them — and the real root is not mounted
+    // yet. mkirf resolved the order at build time; we just run the list.
+    run_hooks()?;
+
+    // Phase 4: mount the squashfs new root.
     if !Path::new(SYSROOT_IMG).exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -249,7 +347,7 @@ fn boot() -> std::io::Result<()> {
     do_mount(&loop_dev, SYSROOT, Some("squashfs"), MS_RDONLY, None)?;
     log(&format!("mounted {loop_dev} at {SYSROOT}"));
 
-    // Phase 4: move kernel vfs into the new root so the new PID 1 has them.
+    // Phase 5: move kernel vfs into the new root so the new PID 1 has them.
     // The squashfs is RO and must ship /proc, /sys, /dev as empty
     // mountpoint dirs — build-staging.sh creates them.
     for sub in &["proc", "sys", "dev"] {
@@ -261,19 +359,19 @@ fn boot() -> std::io::Result<()> {
         })?;
     }
 
-    // Phase 5: cleanup the old rootfs. Walks rootfs's st_dev only; the
+    // Phase 6: cleanup the old rootfs. Walks rootfs's st_dev only; the
     // moved mounts and /sysroot all have different st_devs and stay put.
     let root_dev = fs::metadata("/")?.dev();
     if let Err(e) = cleanup_old_root(root_dev, Path::new("/")) {
         log(&format!("cleanup: {e} (continuing)"));
     }
 
-    // Phase 6: chroot into the new root. We don't mount-move the squashfs
+    // Phase 7: chroot into the new root. We don't mount-move the squashfs
     // over the rootfs (`mount(".", "/", MS_MOVE)`) because the kernel
     // disallows moving onto the rootfs. pivot_root has the same constraint.
-    // chroot is sufficient for Goal One: PID 1 and all descendants see the
+    // chroot is sufficient for now: PID 1 and all descendants see the
     // squashfs as /. The kernel's "real" rootfs is unreachable but still
-    // exists as a namespace bookkeeping artifact (empty after phase 5).
+    // exists as a namespace bookkeeping artifact (empty after phase 6).
     log("pivot: chdir sysroot");
     let sysroot_c = cstr(SYSROOT);
     let slash_c = cstr("/");
@@ -294,7 +392,7 @@ fn boot() -> std::io::Result<()> {
         }
     }
 
-    // Phase 7: exec the real PID 1. Try cmdline init= first, then the
+    // Phase 8: exec the real PID 1. Try cmdline init= first, then the
     // kernel's own fallback chain (/sbin/init, /etc/init, /bin/init, /bin/sh).
     let candidates: Vec<&str> = if !target_init.is_empty() {
         let mut v = Vec::with_capacity(FALLBACK_INITS.len() + 1);
@@ -345,4 +443,29 @@ fn main() {
         log(&format!("boot failed: {e}"));
     }
     halt();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_failure;
+
+    #[test]
+    fn clean_exit_is_not_a_failure() {
+        // status 0: exited normally, code 0.
+        assert!(wait_failure(0).is_none());
+    }
+
+    #[test]
+    fn nonzero_exit_is_reported() {
+        // exit code lives in bits 8..16 of the status word.
+        let reason = wait_failure(1 << 8).expect("a non-zero exit must be a failure");
+        assert!(reason.contains("status 1"), "{reason}");
+    }
+
+    #[test]
+    fn signal_termination_is_reported() {
+        // a termination signal lives in the low 7 bits.
+        let reason = wait_failure(9).expect("a signal kill must be a failure");
+        assert!(reason.contains("signal 9"), "{reason}");
+    }
 }
