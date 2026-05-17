@@ -1,15 +1,9 @@
-[package]
-name        = "prelude"
-version     = "0.0.1"
-description = "Peios initramfs PID 1. Walks the hook list baked into initramfs, then switch_roots into the real PID 1."
-edition     = "2021"
-license     = "MIT"
-publish     = false
+[workspace]
+resolver = "2"
+members  = ["crates/prelude", "crates/mkirf"]
 
-[[bin]]
-name = "prelude"
-path = "src/main.rs"
-
+# Shared release profile. prelude is a size-critical initramfs PID 1;
+# the aggressive settings are harmless for mkirf (a small build tool).
 [profile.release]
 opt-level     = "z"
 lto           = true

@@ -1,0 +1,13 @@
+[package]
+name        = "mkirf"
+version     = "0.0.1"
+description = "Compiles a directory tree into a deterministic initramfs cpio.gz."
+edition     = "2021"
+license     = "MIT"
+publish     = false
+
+[[bin]]
+name = "mkirf"
+path = "src/main.rs"
+
+[dependencies]
