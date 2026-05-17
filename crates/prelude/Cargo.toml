@@ -1,0 +1,11 @@
+[package]
+name        = "prelude"
+version     = "0.0.1"
+description = "Peios initramfs PID 1. Walks the hook list baked into initramfs, then switch_roots into the real PID 1."
+edition     = "2021"
+license     = "MIT"
+publish     = false
+
+[[bin]]
+name = "prelude"
+path = "src/main.rs"
