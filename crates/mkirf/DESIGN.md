@@ -3,7 +3,7 @@
 `mkirf` compiles a directory tree into a deterministic initramfs
 `cpio.gz` — the in-memory root filesystem the kernel unpacks at boot.
 
-**Status:** design settled, implementation not started.
+**Status:** v1 implemented.
 
 ---
 

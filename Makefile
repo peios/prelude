@@ -18,12 +18,15 @@ export PATH := $(RUSTUP_TC)/bin:$(PATH)
 TARGET := x86_64-unknown-linux-musl
 BIN    := target/$(TARGET)/release/prelude
 
-.PHONY: all build clean
+.PHONY: all build test clean
 
 all: build
 
 build:
 	$(CARGO) build --release
+
+test:
+	$(CARGO) test
 
 clean:
 	$(CARGO) clean
