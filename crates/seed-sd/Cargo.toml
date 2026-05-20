@@ -1,0 +1,17 @@
+[package]
+name        = "seed-sd"
+version     = "0.0.1"
+description = "Initramfs helper: seed a default Allow-SYSTEM-GenericAll SD on a path via kacs_set_sd. Used by prelude hooks immediately after mounting a fresh tmpfs to dodge KACS DENY_MISSING."
+edition     = "2021"
+license     = "MIT"
+publish     = false
+
+[[bin]]
+name = "seed-sd"
+path = "src/main.rs"
+
+# libp-sd provides the SD builders + the kacs_set_sd syscall wrapper.
+# Path dep into the pkm workspace because libp-sd lives there and is
+# already wired up for path consumption from outside its workspace.
+[dependencies]
+libp-sd = { path = "../../../pkm/crates/libp-sd" }
