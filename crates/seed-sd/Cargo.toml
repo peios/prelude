@@ -14,4 +14,4 @@ path = "src/main.rs"
 # Path dep into the pkm workspace because libp-sd lives there and is
 # already wired up for path consumption from outside its workspace.
 [dependencies]
-libp-sd = { path = "../../../pkm/crates/libp-sd" }
+libp-sd = { path = "../../../libp-rs/crates/libp-sd" }
