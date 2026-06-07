@@ -226,10 +226,12 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libp-errno"
 version = "0.1.0"
+source = "git+https://github.com/peios/libp-rs.git?tag=v0.1.0#abf405d6a731871860ab68290468c579ef3f52c9"
 
 [[package]]
 name = "libp-sd"
 version = "0.1.0"
+source = "git+https://github.com/peios/libp-rs.git?tag=v0.1.0#abf405d6a731871860ab68290468c579ef3f52c9"
 dependencies = [
  "libp-errno",
  "libp-sys",
@@ -241,6 +243,7 @@ dependencies = [
 [[package]]
 name = "libp-sys"
 version = "0.1.0"
+source = "git+https://github.com/peios/libp-rs.git?tag=v0.1.0#abf405d6a731871860ab68290468c579ef3f52c9"
 dependencies = [
  "libp-errno",
 ]
@@ -248,6 +251,7 @@ dependencies = [
 [[package]]
 name = "libp-wire"
 version = "0.1.0"
+source = "git+https://github.com/peios/libp-rs.git?tag=v0.1.0#abf405d6a731871860ab68290468c579ef3f52c9"
 dependencies = [
  "peios-uapi",
 ]
@@ -329,6 +333,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "peios-uapi"
 version = "0.1.0"
+source = "git+https://github.com/peios/pkm?tag=uapi%2Frust%2Fv0.1.0#c60b028b6a80a79ea324af0565e493b679571af1"
 
 [[package]]
 name = "prelude"
