@@ -11,7 +11,7 @@ name = "seed-sd"
 path = "src/main.rs"
 
 # libp-sd provides the SD builders + the kacs_set_sd syscall wrapper.
-# Path dep into the pkm workspace because libp-sd lives there and is
-# already wired up for path consumption from outside its workspace.
+# Use the tagged public libp-rs repo so standalone prelude checkouts build
+# in the package farm without requiring a monorepo-relative sibling checkout.
 [dependencies]
-libp-sd = { path = "../../../libp-rs/crates/libp-sd" }
+libp-sd = { git = "https://github.com/peios/libp-rs.git", tag = "v0.1.0", package = "libp-sd" }
