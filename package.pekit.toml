@@ -1,0 +1,5 @@
+format = "tar"
+
+[files]
+"target/x86_64-unknown-linux-musl/release/prelude" = "boot/initramfs/init"
+"target/x86_64-unknown-linux-musl/release/seed-sd" = "usr/bin/seed-sd"

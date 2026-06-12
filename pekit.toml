@@ -1,3 +1,5 @@
+outDir = "out"
+
 # NixOS toolchain note: the default cargo/rustc come from a nix-shimmed
 # rustc-wrapper that can't find the musl rustlib, so builds go straight
 # to the rustup-managed binaries (see the old Makefile header).
