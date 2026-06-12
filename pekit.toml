@@ -19,3 +19,6 @@ cp "$R/prelude" "$R/mkirf" "$R/seed-sd" "$PEKIT_OUT/"
 
 [test]
 command = "cargo test"
+
+[clean]
+command = "cargo clean"
