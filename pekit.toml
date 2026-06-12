@@ -2,8 +2,6 @@
 # rustc-wrapper that can't find the musl rustlib, so builds go straight
 # to the rustup-managed binaries (see the old Makefile header).
 
-outDir = "out"
-
 [env]
 TC = "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
 PATH = "$TC:$PATH"
@@ -11,11 +9,7 @@ CARGO = "$TC/cargo"
 RUSTC = "$TC/rustc"
 
 [build]
-command = """
-cargo build --release
-R=target/x86_64-unknown-linux-musl/release
-cp "$R/prelude" "$R/mkirf" "$R/seed-sd" "$PEKIT_OUT/"
-"""
+command = "cargo build --release"
 
 [test]
 command = "cargo test"
