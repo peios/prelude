@@ -2,7 +2,7 @@ format = "peipkg"
 builds = ["main"]   # literal-path sources below; their producer can't be derived
 
 [package]
-version      = "0.0.1-1"
+version      = "{{version}}-1"
 architecture = "x86_64"
 description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seeding helper"
 
