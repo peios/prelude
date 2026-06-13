@@ -1,5 +1,10 @@
-format = "tar"
+format = "peipkg"
 builds = ["main"]   # literal-path sources below; their producer can't be derived
+
+[package]
+version      = "0.0.1-1"
+architecture = "x86_64"
+description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seeding helper"
 
 [files]
 "target/x86_64-unknown-linux-musl/release/prelude" = "boot/initramfs/init"
