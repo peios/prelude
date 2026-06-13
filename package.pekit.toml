@@ -1,4 +1,5 @@
 format = "tar"
+builds = ["main"]   # literal-path sources below; their producer can't be derived
 
 [files]
 "target/x86_64-unknown-linux-musl/release/prelude" = "boot/initramfs/init"
