@@ -1,4 +1,4 @@
-outDir = "out"
+out_dir = "out"
 
 # NixOS toolchain note: the default cargo/rustc come from a nix-shimmed
 # rustc-wrapper that can't find the musl rustlib, so builds go straight
@@ -10,8 +10,13 @@ PATH = "$TC:$PATH"
 CARGO = "$TC/cargo"
 RUSTC = "$TC/rustc"
 
+# pekit's build contract: artifacts must land in $PEKIT_OUT (the build-target
+# stage), which is where the package's ':'-prefixed build-refs read from. Plain
+# `cargo build` writes to ./target in the source tree, leaving the stage empty —
+# so point cargo's target-dir at $PEKIT_OUT/target. (This also keeps the real
+# source tree clean under --local, where the build runs in-place.)
 [build]
-command = "cargo build --release"
+command = 'cargo build --release --target-dir "$PEKIT_OUT/target"'
 
 [test]
 command = "cargo test"
