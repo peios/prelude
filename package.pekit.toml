@@ -1,11 +1,38 @@
 format = "peipkg"
-builds = ["main"]   # literal-path sources below; their producer can't be derived
 
 [package]
+name = "prelude"
 version      = "{{version}}-1"
 architecture = "x86_64"
+# prelude is the initramfs's PID 1 — its home is the initramfs root. default_root
+# places it there for top-level installs/compose without an explicit root=, so
+# nothing has to spell out where prelude goes.
+default_root = "initramfs"
 description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seeding helper"
 
+# prelude is the holder of the `init` role: the kernel execs /init as PID 1 at
+# the root of the unpacked initramfs. The claim materialises /init -> the
+# installed prelude binary as a manager-reconciled symlink. (/init sits at the
+# filesystem root, outside the §3.4 install-path layout — claims deliberately
+# bypass those rules.)
+[provides]
+init = "1"
+
+[claims.provides.init.bin]
+target = "/usr/sbin/prelude"
+path   = "/init"
+
+# prelude runs the initramfs hooks, which are #!/usr/bin/sh scripts, so it needs
+# a shell at runtime. Depending on the `sh` capability (dash provides it) pulls a
+# shell into prelude's root — the initramfs — so the manifest needn't list one.
+# (>= 1 = POSIX-sh capability level, matching dash's `provides sh = "1"`.)
+[dependencies]
+sh = ">= 1"
+
+# Build-refs (leading ':' = the "main" build target's stage output) — cargo
+# writes these under the build stage, so they resolve there, not the source
+# tree. A bare literal path would resolve against the recipe root and trip the
+# static-payload preflight before the build has produced them.
 [files]
-"target/x86_64-unknown-linux-musl/release/prelude" = "boot/initramfs/init"
-"target/x86_64-unknown-linux-musl/release/seed-sd" = "usr/bin/seed-sd"
+":target/x86_64-unknown-linux-musl/release/prelude" = "usr/sbin/prelude"
+":target/x86_64-unknown-linux-musl/release/seed-sd" = "usr/bin/seed-sd"
