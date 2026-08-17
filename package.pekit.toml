@@ -2,8 +2,10 @@ format = "peipkg"
 
 [package]
 name = "prelude"
-version      = "{{version}}-1"
+version      = "{{version}}-3"
 architecture = "x86_64"
+# Required by peipkg. Mirrors what every crate in the workspace declares.
+license      = "MIT"
 # prelude is the initramfs's PID 1 — its home is the initramfs root. default_root
 # places it there for top-level installs/compose without an explicit root=, so
 # nothing has to spell out where prelude goes.
@@ -17,6 +19,16 @@ description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seed
 # bypass those rules.)
 [provides]
 init = "1"
+# The hook outcome contract this prelude honours. Level 1 is the four-way
+# answer: 0 satisfied, 69 declined, 75 deferred, anything else failed.
+#
+# A capability rather than a version constraint, because what a hook needs to
+# know is not "which prelude is this" but "will exit 69 be read as declining
+# or as an error?". A hook that stands aside with 69 in front of a prelude
+# that predates this contract does not merely misbehave — it HALTS THE BOOT,
+# and it is the boot it was standing aside for. Declaring it makes that a
+# compose-time failure with a readable message instead.
+hook-outcomes = "1"
 
 [claims.provides.init.bin]
 target = "/usr/sbin/prelude"
