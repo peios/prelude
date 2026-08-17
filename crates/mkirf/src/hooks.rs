@@ -6,6 +6,34 @@
 //! switch_root. Each hook declares its ordering in a fenced comment block
 //! (PEP 723-style); mkirf topologically sorts the resulting capability
 //! DAG and bakes the order into `hooks.seq`. See boot-design.md §3.6.
+//!
+//! # The four ordering keys
+//!
+//! A capability is *supplied* in one of two ways, and consumed in one of
+//! two ways. Which pair a hook uses is the whole of its ordering.
+//!
+//! | key | kind | meaning |
+//! |---|---|---|
+//! | `provides` | supply | an ALTERNATIVE — any one provider suffices |
+//! | `contributes` | supply | a CONTRIBUTOR — all of them must complete |
+//! | `requires` | consume | hard: something must supply it, or the build fails |
+//! | `after` | consume | soft: order after it if anything supplies it, else just run |
+//!
+//! `contributes` is what makes "run *before* X" expressible at all. A hook
+//! is otherwise ordered only by what it consumes, so running before the
+//! root is mounted would mean the root-mount hooks naming a hook that did
+//! not exist when they were packaged. Declaring yourself part of X inverts
+//! that: anything consuming X now waits for you.
+//!
+//! `after` is what makes a shared capability vocabulary survivable. A hard
+//! `requires` on a name nothing supplies is a build error, so a standard
+//! name like `network-up` would break every image without networking the
+//! moment anything mentioned it.
+//!
+//! The alternatives/contributors distinction does not change the ORDER —
+//! both put suppliers before consumers — so this module treats them alike
+//! when building edges. It changes what a runtime scheduler may skip, and
+//! is enforced here only as a validity rule: a capability may not be both.
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
@@ -20,14 +48,42 @@ pub const SEQ_VERSION_LINE: &str = "hookseq 1";
 pub struct Hook {
     /// File name within `hooks/`, e.g. `"luks-unlock.sh"`.
     pub name: String,
-    /// Capabilities this hook satisfies.
+    /// Capabilities this hook satisfies on its own — alternatives, any one
+    /// of which suffices.
     pub provides: Vec<String>,
-    /// Capabilities that must be satisfied before this hook runs.
+    /// Capabilities this hook is one contributor to. Every contributor must
+    /// complete before the capability is satisfied.
+    pub contributes: Vec<String>,
+    /// Capabilities that must be satisfied before this hook runs. Something
+    /// must supply each of them or the build fails.
     pub requires: Vec<String>,
+    /// Capabilities to be ordered after *if anything supplies them*. Unlike
+    /// `requires`, an unsupplied name is not an error — the constraint
+    /// simply has nothing to attach to.
+    pub after: Vec<String>,
     /// Whether the hook carried a `# /// hook` metadata block at all.
     /// A hook with no block is the escape hatch (§3.6): valid, but
     /// scheduled last and warned about.
     pub has_block: bool,
+}
+
+impl Hook {
+    /// Capabilities this hook supplies, by either means. Ordering treats
+    /// the two alike; only validity and a runtime scheduler tell them apart.
+    fn supplies(&self) -> impl Iterator<Item = &str> + '_ {
+        self.provides.iter().chain(self.contributes.iter()).map(String::as_str)
+    }
+
+    /// Capabilities this hook waits on, by either means.
+    fn consumes(&self) -> impl Iterator<Item = &str> + '_ {
+        self.requires.iter().chain(self.after.iter()).map(String::as_str)
+    }
+
+    /// Whether the hook declared any ordering at all. One that declared
+    /// none runs after every hook that did.
+    fn is_constrained(&self) -> bool {
+        self.supplies().next().is_some() || self.consumes().next().is_some()
+    }
 }
 
 /// The resolved hook execution order plus any build-time advisories.
@@ -63,7 +119,9 @@ pub fn discover(hooks_dir: &Path) -> Result<Vec<Hook>, Box<dyn Error>> {
         hooks.push(Hook {
             name,
             provides: parsed.provides,
+            contributes: parsed.contributes,
             requires: parsed.requires,
+            after: parsed.after,
             has_block: parsed.has_block,
         });
     }
@@ -72,10 +130,12 @@ pub fn discover(hooks_dir: &Path) -> Result<Vec<Hook>, Box<dyn Error>> {
 }
 
 /// The metadata extracted from a single hook script.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Parsed {
     provides: Vec<String>,
+    contributes: Vec<String>,
     requires: Vec<String>,
+    after: Vec<String>,
     has_block: bool,
 }
 
@@ -91,7 +151,7 @@ fn parse_block(text: &str) -> Result<Parsed, String> {
 
     let Some(open) = lines.iter().position(|l| l.trim_end() == "# /// hook") else {
         // No block at all — the escape hatch.
-        return Ok(Parsed { provides: Vec::new(), requires: Vec::new(), has_block: false });
+        return Ok(Parsed::default());
     };
     if lines[open + 1..].iter().any(|l| l.trim_end() == "# /// hook") {
         return Err("more than one `# /// hook` metadata block".into());
@@ -122,16 +182,19 @@ fn parse_block(text: &str) -> Result<Parsed, String> {
         return Err("`# /// hook` block is never closed with `# ///`".into());
     }
 
-    let (provides, requires) = parse_toml_subset(&content)?;
-    Ok(Parsed { provides, requires, has_block: true })
+    let mut parsed = parse_toml_subset(&content)?;
+    parsed.has_block = true;
+    Ok(parsed)
 }
 
 /// Parse the metadata block's content — the TOML subset mkirf accepts:
 /// blank lines, `#` comments, and top-level `key = ["str", ...]`
-/// assignments where `key` is `provides` or `requires`.
-fn parse_toml_subset(content: &[(usize, String)]) -> Result<(Vec<String>, Vec<String>), String> {
+/// assignments where `key` is one of the four ordering keys.
+fn parse_toml_subset(content: &[(usize, String)]) -> Result<Parsed, String> {
     let mut provides: Option<Vec<String>> = None;
+    let mut contributes: Option<Vec<String>> = None;
     let mut requires: Option<Vec<String>> = None;
+    let mut after: Option<Vec<String>> = None;
 
     for (lineno, raw) in content {
         let line = raw.trim();
@@ -143,10 +206,13 @@ fn parse_toml_subset(content: &[(usize, String)]) -> Result<(Vec<String>, Vec<St
             .ok_or_else(|| format!("line {lineno}: expected `key = [...]`"))?;
         let slot = match key.trim() {
             "provides" => &mut provides,
+            "contributes" => &mut contributes,
             "requires" => &mut requires,
+            "after" => &mut after,
             other => {
                 return Err(format!(
-                    "line {lineno}: unknown key `{other}` (expected `provides` or `requires`)"
+                    "line {lineno}: unknown key `{other}` \
+                     (expected `provides`, `contributes`, `requires` or `after`)"
                 ))
             }
         };
@@ -156,7 +222,13 @@ fn parse_toml_subset(content: &[(usize, String)]) -> Result<(Vec<String>, Vec<St
         *slot = Some(parse_string_array(value.trim()).map_err(|e| format!("line {lineno}: {e}"))?);
     }
 
-    Ok((provides.unwrap_or_default(), requires.unwrap_or_default()))
+    Ok(Parsed {
+        provides: provides.unwrap_or_default(),
+        contributes: contributes.unwrap_or_default(),
+        requires: requires.unwrap_or_default(),
+        after: after.unwrap_or_default(),
+        has_block: false,
+    })
 }
 
 /// Parse a TOML inline array of double-quoted strings: `["a", "b"]`.
@@ -197,29 +269,47 @@ fn parse_string_array(s: &str) -> Result<Vec<String>, String> {
 
 /// Topologically sort `hooks` into an execution order.
 ///
-/// Constrained hooks — those declaring any `provides`/`requires` — are
+/// Constrained hooks — those declaring any of the four ordering keys — are
 /// ordered by their capability DAG: Kahn's algorithm, ties broken by file
-/// name in `LC_ALL=C` byte order. Unconstrained hooks (both lists empty,
-/// block present or not) run afterwards in name order. A dependency
-/// cycle, or a `requires` no hook satisfies, is an error.
+/// name in `LC_ALL=C` byte order. Unconstrained hooks (every list empty,
+/// block present or not) run afterwards in name order.
+///
+/// Three things are errors: a dependency cycle, a `requires` nothing
+/// supplies, and a capability that is both provided and contributed to.
 pub fn resolve(hooks: &[Hook]) -> Result<Resolved, String> {
     // Work from a name-sorted view so the result does not depend on the
     // order `discover` happened to return.
     let mut sorted: Vec<&Hook> = hooks.iter().collect();
     sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
-    let (constrained, unconstrained): (Vec<&Hook>, Vec<&Hook>) = sorted
-        .into_iter()
-        .partition(|h| !h.provides.is_empty() || !h.requires.is_empty());
+    let (constrained, unconstrained): (Vec<&Hook>, Vec<&Hook>) =
+        sorted.into_iter().partition(|h| h.is_constrained());
 
-    // Every required capability must be provided by some hook.
-    let all_provides: BTreeSet<&str> = hooks
-        .iter()
-        .flat_map(|h| h.provides.iter().map(String::as_str))
-        .collect();
+    // A capability is either a set of alternatives or a set of contributors.
+    // Mixing the two leaves no answer to "is it satisfied yet?" — the
+    // alternatives say one is enough, the contributors say all are needed —
+    // so it is rejected here rather than resolved arbitrarily at boot.
+    let provided: BTreeSet<&str> =
+        hooks.iter().flat_map(|h| h.provides.iter().map(String::as_str)).collect();
+    let contributed: BTreeSet<&str> =
+        hooks.iter().flat_map(|h| h.contributes.iter().map(String::as_str)).collect();
+    if let Some(&cap) = provided.intersection(&contributed).next() {
+        let providers = named_hooks(hooks, |h| h.provides.iter().any(|c| c == cap));
+        let contributors = named_hooks(hooks, |h| h.contributes.iter().any(|c| c == cap));
+        return Err(format!(
+            "capability `{cap}` is both provided (by {providers}) and contributed to \
+             (by {contributors}); a capability is either alternatives, where one \
+             supplier suffices, or contributors, where all must complete — not both",
+        ));
+    }
+
+    // Every hard requirement must be supplied by some hook, by either means.
+    // `after` is deliberately exempt: an unsupplied soft edge simply has
+    // nothing to attach to, which is the whole reason it exists.
+    let all_supplied: BTreeSet<&str> = provided.union(&contributed).copied().collect();
     for h in &constrained {
         for req in &h.requires {
-            if !all_provides.contains(req.as_str()) {
+            if !all_supplied.contains(req.as_str()) {
                 return Err(format!(
                     "hook `{}` requires capability `{}`, which no hook provides",
                     h.name, req,
@@ -253,27 +343,40 @@ pub fn resolve(hooks: &[Hook]) -> Result<Resolved, String> {
     Ok(Resolved { order: paths, warnings })
 }
 
+/// A comma-separated, name-sorted list of the hooks matching `pred`, for
+/// error messages that have to name who caused the problem.
+fn named_hooks(hooks: &[Hook], pred: impl Fn(&Hook) -> bool) -> String {
+    let mut names: Vec<&str> =
+        hooks.iter().filter(|h| pred(h)).map(|h| h.name.as_str()).collect();
+    names.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    names.join(", ")
+}
+
 /// Kahn's algorithm over the constrained hooks. Returns indices into
 /// `constrained` in execution order, or an error naming the hooks caught
 /// in a dependency cycle.
 fn kahn_sort(constrained: &[&Hook]) -> Result<Vec<usize>, String> {
     let n = constrained.len();
 
-    // capability -> indices of constrained hooks that provide it.
-    let mut providers: HashMap<&str, Vec<usize>> = HashMap::new();
+    // capability -> indices of constrained hooks that supply it. Providers
+    // and contributors both land here: the two differ in what a runtime
+    // scheduler may skip, not in who runs first.
+    let mut suppliers: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, h) in constrained.iter().enumerate() {
-        for cap in &h.provides {
-            providers.entry(cap.as_str()).or_default().push(i);
+        for cap in h.supplies() {
+            suppliers.entry(cap).or_default().push(i);
         }
     }
 
-    // Edges p -> c: provider p must run before consumer c. A BTreeSet
-    // dedups (a provider supplying two capabilities one hook needs) and
-    // keeps iteration deterministic.
+    // Edges p -> c: supplier p must run before consumer c. `requires` and
+    // `after` produce the same edge — they differ only in whether an
+    // unsupplied capability is an error, which `resolve` has already
+    // decided by this point. A BTreeSet dedups (a supplier supplying two
+    // capabilities one hook consumes) and keeps iteration deterministic.
     let mut edge_set: BTreeSet<(usize, usize)> = BTreeSet::new();
     for (c, h) in constrained.iter().enumerate() {
-        for req in &h.requires {
-            for &p in providers.get(req.as_str()).into_iter().flatten() {
+        for cap in h.consumes() {
+            for &p in suppliers.get(cap).into_iter().flatten() {
                 if p != c {
                     edge_set.insert((p, c));
                 }
@@ -331,12 +434,30 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Build a hook with a metadata block present.
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Build a hook with a metadata block present, declaring only the two
+    /// original keys — the shape most of these tests need.
     fn hook(name: &str, provides: &[&str], requires: &[&str]) -> Hook {
+        hook4(name, provides, &[], requires, &[])
+    }
+
+    /// Build a hook declaring any of the four ordering keys.
+    fn hook4(
+        name: &str,
+        provides: &[&str],
+        contributes: &[&str],
+        requires: &[&str],
+        after: &[&str],
+    ) -> Hook {
         Hook {
             name: name.to_string(),
-            provides: provides.iter().map(|s| s.to_string()).collect(),
-            requires: requires.iter().map(|s| s.to_string()).collect(),
+            provides: strs(provides),
+            contributes: strs(contributes),
+            requires: strs(requires),
+            after: strs(after),
             has_block: true,
         }
     }
@@ -393,6 +514,30 @@ mod tests {
     fn unknown_key_is_an_error() {
         let err = parse_block("# /// hook\n# requirez = [\"x\"]\n# ///\n").unwrap_err();
         assert!(err.contains("unknown key"), "{err}");
+        // The message lists what IS accepted, so a typo is self-correcting.
+        assert!(err.contains("contributes") && err.contains("after"), "{err}");
+    }
+
+    #[test]
+    fn all_four_keys_are_parsed() {
+        let text = "#!/bin/sh\n\
+                     # /// hook\n\
+                     # provides = [\"root-mounted\"]\n\
+                     # contributes = [\"storage-ready\"]\n\
+                     # requires = [\"modules-loaded\"]\n\
+                     # after = [\"network-up\"]\n\
+                     # ///\n";
+        let p = parse_block(text).unwrap();
+        assert_eq!(p.provides, ["root-mounted"]);
+        assert_eq!(p.contributes, ["storage-ready"]);
+        assert_eq!(p.requires, ["modules-loaded"]);
+        assert_eq!(p.after, ["network-up"]);
+    }
+
+    #[test]
+    fn duplicate_contributes_is_an_error() {
+        let text = "# /// hook\n# contributes = [\"a\"]\n# contributes = [\"b\"]\n# ///\n";
+        assert!(parse_block(text).unwrap_err().contains("duplicate key"));
     }
 
     #[test]
@@ -469,6 +614,106 @@ mod tests {
         let hooks = vec![hook("a.sh", &[], &["nonexistent"])];
         let err = resolve(&hooks).unwrap_err();
         assert!(err.contains("no hook provides"), "{err}");
+    }
+
+    // --- contributes -----------------------------------------------------
+
+    #[test]
+    fn contributes_orders_before_the_consumer() {
+        // The "before" case the model could not express: a hook declares
+        // itself part of a capability, and the consumer waits for it.
+        let hooks = vec![
+            hook("z-consumer.sh", &[], &["storage-ready"]),
+            hook4("a-part.sh", &[], &["storage-ready"], &[], &[]),
+        ];
+        assert_eq!(order_of(&hooks), ["/hooks/a-part.sh", "/hooks/z-consumer.sh"]);
+    }
+
+    #[test]
+    fn contributes_satisfies_a_hard_requires() {
+        // A capability supplied only by contributors is still supplied.
+        let hooks = vec![
+            hook("consumer.sh", &[], &["storage-ready"]),
+            hook4("part.sh", &[], &["storage-ready"], &[], &[]),
+        ];
+        assert!(resolve(&hooks).is_ok());
+    }
+
+    #[test]
+    fn every_contributor_runs_before_the_consumer() {
+        let hooks = vec![
+            hook("d-consumer.sh", &[], &["cap"]),
+            hook4("a-part.sh", &[], &["cap"], &[], &[]),
+            hook4("b-part.sh", &[], &["cap"], &[], &[]),
+        ];
+        assert_eq!(
+            order_of(&hooks),
+            ["/hooks/a-part.sh", "/hooks/b-part.sh", "/hooks/d-consumer.sh"],
+        );
+    }
+
+    #[test]
+    fn a_capability_cannot_be_both_provided_and_contributed() {
+        let hooks = vec![
+            hook("alt.sh", &["cap"], &[]),
+            hook4("part.sh", &[], &["cap"], &[], &[]),
+        ];
+        let err = resolve(&hooks).unwrap_err();
+        assert!(err.contains("both provided"), "{err}");
+        // Both sides are named, so the conflict is actionable.
+        assert!(err.contains("alt.sh") && err.contains("part.sh"), "{err}");
+    }
+
+    // --- after -----------------------------------------------------------
+
+    #[test]
+    fn after_orders_when_the_capability_is_supplied() {
+        let hooks = vec![
+            hook4("a-late.sh", &[], &[], &[], &["net"]),
+            hook("z-net.sh", &["net"], &[]),
+        ];
+        // Name order would put a-late.sh first; the soft edge overrides it.
+        assert_eq!(order_of(&hooks), ["/hooks/z-net.sh", "/hooks/a-late.sh"]);
+    }
+
+    #[test]
+    fn after_an_unsupplied_capability_is_not_an_error() {
+        // The whole point of `after`: naming a capability this image does
+        // not have must not break the build the way `requires` does.
+        let hooks = vec![hook4("solo.sh", &[], &[], &[], &["network-up"])];
+        let r = resolve(&hooks).unwrap();
+        assert_eq!(r.order, ["/hooks/solo.sh"]);
+    }
+
+    #[test]
+    fn after_alone_still_counts_as_constrained() {
+        // A hook declaring only `after` has stated an ordering intent, so it
+        // belongs in the DAG rather than in the unconstrained tail.
+        let hooks = vec![
+            hook4("a-soft.sh", &[], &[], &[], &["absent"]),
+            hook("z-free.sh", &[], &[]),
+        ];
+        assert_eq!(order_of(&hooks), ["/hooks/a-soft.sh", "/hooks/z-free.sh"]);
+    }
+
+    #[test]
+    fn after_is_satisfied_by_a_contributor_too() {
+        let hooks = vec![
+            hook4("a-late.sh", &[], &[], &[], &["cap"]),
+            hook4("z-part.sh", &[], &["cap"], &[], &[]),
+        ];
+        assert_eq!(order_of(&hooks), ["/hooks/z-part.sh", "/hooks/a-late.sh"]);
+    }
+
+    #[test]
+    fn a_cycle_through_after_is_still_rejected() {
+        // Soft edges are still edges: they cannot be used to smuggle in an
+        // unorderable set.
+        let hooks = vec![
+            hook4("a.sh", &["a"], &[], &[], &["b"]),
+            hook4("b.sh", &["b"], &[], &[], &["a"]),
+        ];
+        assert!(resolve(&hooks).unwrap_err().contains("cycle"));
     }
 
     #[test]
