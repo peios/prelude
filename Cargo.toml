@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members  = ["crates/prelude", "crates/mkirf", "crates/seed-sd"]
+members  = ["crates/prelude", "crates/seed-sd"]
 
-# Shared release profile. prelude is a size-critical initramfs PID 1;
-# the aggressive settings are harmless for mkirf (a small build tool).
+# Shared release profile. prelude is a size-critical initramfs PID 1, so
+# the settings are tuned for size over speed.
 [profile.release]
 opt-level     = "z"
 lto           = true
