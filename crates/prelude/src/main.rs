@@ -84,6 +84,40 @@ const HOOK_SEQ_LEGACY: &str = "/hooks.seq";
 const HOOK_SEQ_VERSION: &str = "hookseq 1";
 const HOOK_SEQ_V2_VERSION: &str = "hookseq 2";
 
+// What a hook's exit status means. A hook is a shell script, so its exit
+// code is the only channel it has, and two outcomes beyond success/failure
+// need saying.
+//
+// The values are borrowed from sysexits.h rather than invented, for the
+// practical reason that 0-2 are what any failing command returns and
+// 126/127/128+n are the shell's own, so a small dedicated range is the only
+// place a deliberate signal cannot be confused with an accident.
+//
+//   EX_UNAVAILABLE  "not applicable on this machine" — the hook declines,
+//                   and is not counted toward the capabilities it declared.
+//   EX_TEMPFAIL     "not yet" — the hook's inputs are not ready, it has done
+//                   NOTHING, and prelude should try it again later.
+//
+// The distinction between DECLINED and DEFERRED and plain failure is what
+// makes re-running safe: a deferring hook contracts to have made no change,
+// which is exactly the guarantee a failed hook cannot give.
+const HOOK_DECLINED: i32 = 69;
+const HOOK_DEFERRED: i32 = 75;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// The hook did its part. Its `provides` are achieved; its
+    /// `contributes` are one step closer to complete.
+    Satisfied,
+    /// The hook had nothing to do here. For an alternative (`provides`) it
+    /// abstains and some other provider must satisfy the capability; for a
+    /// conjunction (`contributes`) it completes trivially, because "nothing
+    /// needed doing" is a way of being done.
+    Declined,
+    /// The hook cannot run yet and has changed nothing. Re-queued.
+    Deferred,
+}
+
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("nul in string")
 }
@@ -279,6 +313,19 @@ fn find_hook_seqs() -> Vec<(u32, String)> {
     found
 }
 
+// One hook as the sequence describes it: where it lives, and what it says
+// about its own ordering. A version-1 sequence yields these with every
+// declaration empty — that format carries an order and nothing else, so
+// every hook is immediately ready and they run exactly as listed.
+#[derive(Debug, Default, Clone)]
+struct SeqHook {
+    path: String,
+    provides: Vec<String>,
+    contributes: Vec<String>,
+    requires: Vec<String>,
+    after: Vec<String>,
+}
+
 // The sequence chosen from what the image offers, plus any newer one that
 // was passed over.
 #[derive(Debug)]
@@ -329,7 +376,7 @@ fn select_hook_seq(found: &[(u32, String)]) -> Result<SeqChoice<'_>, String> {
 // matters: treating an absent file as "no hooks" would turn a
 // misnamed or missing manifest into a boot that mounts no root and reports
 // the failure far from its cause.
-fn read_hook_seq() -> std::io::Result<Vec<String>> {
+fn read_hook_seq() -> std::io::Result<Vec<SeqHook>> {
     let found = find_hook_seqs();
     let choice = select_hook_seq(&found).map_err(std::io::Error::other)?;
     let (version, path) = (choice.version, choice.path);
@@ -363,7 +410,13 @@ fn read_hook_seq() -> std::io::Result<Vec<String>> {
 
     log(&format!("hook sequence: {path}"));
     match version {
-        0 | 1 => Ok(lines.filter(|l| !l.is_empty()).map(str::to_string).collect()),
+        0 | 1 => Ok(lines
+            .filter(|l| !l.is_empty())
+            .map(|l| SeqHook {
+                path: l.to_string(),
+                ..SeqHook::default()
+            })
+            .collect()),
         _ => parse_hook_seq_v2(path, lines),
     }
 }
@@ -383,8 +436,8 @@ fn read_hook_seq() -> std::io::Result<Vec<String>> {
 fn parse_hook_seq_v2<'a>(
     path: &str,
     lines: impl Iterator<Item = &'a str>,
-) -> std::io::Result<Vec<String>> {
-    let mut order: Vec<String> = Vec::new();
+) -> std::io::Result<Vec<SeqHook>> {
+    let mut hooks: Vec<SeqHook> = Vec::new();
     for (i, line) in lines.enumerate() {
         if line.is_empty() {
             continue;
@@ -394,30 +447,37 @@ fn parse_hook_seq_v2<'a>(
             Some((k, r)) => (k, r.trim()),
             None => (line, ""),
         };
-        match key {
-            "hook" => {
-                if rest.is_empty() {
-                    return Err(std::io::Error::other(format!(
-                        "{path}: line {lineno}: `hook` with no path"
-                    )));
-                }
-                order.push(rest.to_string());
+        if key == "hook" {
+            if rest.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "{path}: line {lineno}: `hook` with no path"
+                )));
             }
-            "provides" | "contributes" | "requires" | "after" => {
-                if order.is_empty() {
-                    return Err(std::io::Error::other(format!(
-                        "{path}: line {lineno}: `{key}` before any `hook` line"
-                    )));
-                }
-            }
+            hooks.push(SeqHook {
+                path: rest.to_string(),
+                ..SeqHook::default()
+            });
+            continue;
+        }
+        let Some(open) = hooks.last_mut() else {
+            return Err(std::io::Error::other(format!(
+                "{path}: line {lineno}: `{key}` before any `hook` line"
+            )));
+        };
+        let slot = match key {
+            "provides" => &mut open.provides,
+            "contributes" => &mut open.contributes,
+            "requires" => &mut open.requires,
+            "after" => &mut open.after,
             other => {
                 return Err(std::io::Error::other(format!(
                     "{path}: line {lineno}: unknown key `{other}`"
                 )))
             }
-        }
+        };
+        slot.extend(rest.split_whitespace().map(str::to_string));
     }
-    Ok(order)
+    Ok(hooks)
 }
 
 // Fork-exec one hook and wait for it. The hook is a script; the kernel
@@ -425,7 +485,7 @@ fn parse_hook_seq_v2<'a>(
 // The hook runs with PATH=/usr/bin so it finds peiosutils and friends without
 // depending on a root-level view that does not yet exist.
 // A hook that does not exit 0 fails the boot.
-fn run_one_hook(path: &str) -> std::io::Result<()> {
+fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
     let pid = unsafe { fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
@@ -452,9 +512,19 @@ fn run_one_hook(path: &str) -> std::io::Result<()> {
     if unsafe { waitpid(pid, &mut status, 0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    match wait_failure(status) {
-        None => Ok(()),
-        Some(reason) => Err(std::io::Error::other(format!("hook {path}: {reason}"))),
+    // A signal or a stop is a failure whatever the code would have been —
+    // a hook killed mid-write has not "declined" anything.
+    if status & 0x7f != 0 {
+        let reason = wait_failure(status).unwrap_or_else(|| "terminated abnormally".to_string());
+        return Err(std::io::Error::other(format!("hook {path}: {reason}")));
+    }
+    match (status >> 8) & 0xff {
+        0 => Ok(Outcome::Satisfied),
+        HOOK_DECLINED => Ok(Outcome::Declined),
+        HOOK_DEFERRED => Ok(Outcome::Deferred),
+        code => Err(std::io::Error::other(format!(
+            "hook {path}: exited with status {code}"
+        ))),
     }
 }
 
@@ -520,17 +590,152 @@ fn run_hooks(breaks: &Breakpoints) -> std::io::Result<()> {
         log("no hooks to run");
         return Ok(());
     }
-    for hook in &hooks {
-        if breaks.breaks_before(hook) {
-            rescue_shell(&format!(
-                "rd.break: stopping before hook {hook} (exit to continue)"
-            ));
-        }
-        log(&format!("hook: {hook}"));
-        run_one_hook(hook)?;
+    schedule_hooks(&hooks, breaks, run_one_hook)
+}
+
+// Whether every supplier of `cap` has finished — nothing that could still
+// contribute to it is outstanding.
+//
+// This is what `after` waits on. A capability nothing supplies is settled
+// vacuously, which is exactly what makes `after` safe to name against a
+// milestone this image does not have.
+fn cap_settled(hooks: &[SeqHook], state: &[Option<Outcome>], cap: &str) -> bool {
+    hooks
+        .iter()
+        .zip(state)
+        .filter(|(h, _)| h.provides.iter().chain(&h.contributes).any(|c| c == cap))
+        .all(|(_, s)| matches!(s, Some(Outcome::Satisfied) | Some(Outcome::Declined)))
+}
+
+// Whether `cap` has actually been achieved, which is stricter than settled
+// and is what `requires` waits on.
+//
+// The two supply kinds answer it differently, and the difference IS the
+// distinction between them:
+//
+//   provides     alternatives. Achieved once ANY provider is satisfied. If
+//                every provider declined, the capability is settled and
+//                never achieved — nobody was willing to be the one.
+//   contributes  a conjunction. Achieved once every contributor has
+//                finished, whether by doing its part or by declining,
+//                since "nothing needed doing here" is a way of being done.
+fn cap_achieved(hooks: &[SeqHook], state: &[Option<Outcome>], cap: &str) -> bool {
+    if !cap_settled(hooks, state, cap) {
+        return false;
     }
-    log(&format!("ran {} hook(s)", hooks.len()));
-    Ok(())
+    let provided = hooks.iter().any(|h| h.provides.iter().any(|c| c == cap));
+    if !provided {
+        return true;
+    }
+    hooks
+        .iter()
+        .zip(state)
+        .any(|(h, s)| h.provides.iter().any(|c| c == cap) && *s == Some(Outcome::Satisfied))
+}
+
+// Whether hook `i` can run now.
+fn hook_ready(hooks: &[SeqHook], state: &[Option<Outcome>], i: usize) -> bool {
+    let h = &hooks[i];
+    h.requires.iter().all(|c| cap_achieved(hooks, state, c))
+        && h.after.iter().all(|c| cap_settled(hooks, state, c))
+}
+
+// Why the boot cannot continue, named hook by hook. Called only when a pass
+// completed nothing and work remains, so every message here describes a
+// genuine dead end rather than a hook that is merely waiting its turn.
+fn stuck_reason(hooks: &[SeqHook], state: &[Option<Outcome>]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, h) in hooks.iter().enumerate() {
+        if matches!(state[i], Some(Outcome::Satisfied) | Some(Outcome::Declined)) {
+            continue;
+        }
+        let mut why: Vec<String> = Vec::new();
+        for cap in &h.requires {
+            if cap_settled(hooks, state, cap) {
+                if !cap_achieved(hooks, state, cap) {
+                    why.push(format!("`{cap}` — every provider declined it"));
+                }
+            } else {
+                why.push(format!("`{cap}` — not achieved"));
+            }
+        }
+        for cap in &h.after {
+            if !cap_settled(hooks, state, cap) {
+                why.push(format!("`{cap}` — not settled"));
+            }
+        }
+        if why.is_empty() {
+            // Ready every time it was tried, and deferred every time.
+            why.push("deferred with nothing left to wait for".to_string());
+        }
+        lines.push(format!("  {}: {}", h.path, why.join("; ")));
+    }
+    format!("hooks cannot proceed:\n{}", lines.join("\n"))
+}
+
+// Run the hooks, scheduling from their declarations rather than replaying a
+// fixed list.
+//
+// Repeated passes in sequence order, running whatever is ready. A hook that
+// DEFERS is left pending and tried again on a later pass; only a terminal
+// outcome counts as progress. A pass that completes nothing while work
+// remains is a dead end, not a reason to keep spinning.
+//
+// Worst case is O(n²) runs, and that is affordable precisely because
+// deferral means the hook did nothing: re-running it is free in a way that
+// re-running a FAILED hook could never be, since a failure may have left a
+// half-assembled array or burned an unlock attempt behind it.
+//
+// The runner is a parameter so the scheduling can be tested without forking
+// anything.
+fn schedule_hooks(
+    hooks: &[SeqHook],
+    breaks: &Breakpoints,
+    mut run: impl FnMut(&str) -> std::io::Result<Outcome>,
+) -> std::io::Result<()> {
+    let mut state: Vec<Option<Outcome>> = vec![None; hooks.len()];
+    let mut ran = 0usize;
+
+    loop {
+        let mut progressed = false;
+        for i in 0..hooks.len() {
+            if matches!(state[i], Some(Outcome::Satisfied) | Some(Outcome::Declined)) {
+                continue;
+            }
+            if !hook_ready(hooks, &state, i) {
+                continue;
+            }
+            let path = &hooks[i].path;
+            if breaks.breaks_before(path) {
+                rescue_shell(&format!(
+                    "rd.break: stopping before hook {path} (exit to continue)"
+                ));
+            }
+            log(&format!("hook: {path}"));
+            let outcome = run(path)?;
+            ran += 1;
+            match outcome {
+                Outcome::Satisfied => progressed = true,
+                Outcome::Declined => {
+                    log(&format!("hook: {path}: declined (not applicable here)"));
+                    progressed = true;
+                }
+                Outcome::Deferred => log(&format!("hook: {path}: deferred (will retry)")),
+            }
+            state[i] = Some(outcome);
+        }
+
+        if state
+            .iter()
+            .all(|s| matches!(s, Some(Outcome::Satisfied) | Some(Outcome::Declined)))
+        {
+            log(&format!("ran {ran} hook invocation(s)"));
+            return Ok(());
+        }
+        if !progressed {
+            return Err(std::io::Error::other(stuck_reason(hooks, &state)));
+        }
+    }
 }
 
 // The real work. Returns only on failure — success exits via execve. A
@@ -718,9 +923,238 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmdline_has, parse_hook_seq_v2, select_hook_seq, wait_failure, Breakpoints,
-        FALLBACK_INITS, RESCUE_SHELL,
+        cmdline_has, parse_hook_seq_v2, schedule_hooks, select_hook_seq, wait_failure,
+        Breakpoints, Outcome, SeqHook, FALLBACK_INITS, RESCUE_SHELL,
     };
+    use std::cell::RefCell;
+
+    fn paths(hooks: &[SeqHook]) -> Vec<&str> {
+        hooks.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    /// A hook declaring the four keys, for scheduler tests.
+    fn h(
+        path: &str,
+        provides: &[&str],
+        contributes: &[&str],
+        requires: &[&str],
+        after: &[&str],
+    ) -> SeqHook {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        SeqHook {
+            path: path.to_string(),
+            provides: own(provides),
+            contributes: own(contributes),
+            requires: own(requires),
+            after: own(after),
+        }
+    }
+
+    /// Run the scheduler against scripted outcomes, returning the order in
+    /// which hooks were actually invoked (repeats included, so deferral is
+    /// visible).
+    ///
+    /// `script` maps a hook path to the outcomes it returns on successive
+    /// invocations; the last entry repeats once exhausted.
+    fn drive(
+        hooks: &[SeqHook],
+        script: &[(&str, &[Outcome])],
+    ) -> (std::io::Result<()>, Vec<String>) {
+        let calls = RefCell::new(Vec::<String>::new());
+        let result = schedule_hooks(hooks, &Breakpoints::default(), |path| {
+            let mut calls = calls.borrow_mut();
+            let n = calls.iter().filter(|c| *c == path).count();
+            calls.push(path.to_string());
+            let outcomes = script
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, o)| *o)
+                .unwrap_or(&[Outcome::Satisfied]);
+            Ok(outcomes[n.min(outcomes.len() - 1)])
+        });
+        let calls = calls.into_inner();
+        (result, calls)
+    }
+
+    // --- the scheduler ---------------------------------------------------
+
+    #[test]
+    fn a_sequence_with_no_declarations_runs_in_order() {
+        // What a version-1 sequence yields: no edges, so the listed order is
+        // the order, and nothing about the scheduler may disturb it.
+        let hooks = vec![
+            h("/hooks/a.sh", &[], &[], &[], &[]),
+            h("/hooks/b.sh", &[], &[], &[], &[]),
+            h("/hooks/c.sh", &[], &[], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[]);
+        assert!(r.is_ok());
+        assert_eq!(calls, ["/hooks/a.sh", "/hooks/b.sh", "/hooks/c.sh"]);
+    }
+
+    #[test]
+    fn a_requirer_waits_for_its_provider_despite_sequence_position() {
+        let hooks = vec![
+            h("/hooks/consumer.sh", &[], &[], &["cap"], &[]),
+            h("/hooks/provider.sh", &["cap"], &[], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[]);
+        assert!(r.is_ok());
+        assert_eq!(calls, ["/hooks/provider.sh", "/hooks/consumer.sh"]);
+    }
+
+    #[test]
+    fn every_contributor_runs_before_the_capability_is_achieved() {
+        let hooks = vec![
+            h("/hooks/consumer.sh", &[], &[], &["cap"], &[]),
+            h("/hooks/part-a.sh", &[], &["cap"], &[], &[]),
+            h("/hooks/part-b.sh", &[], &["cap"], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[]);
+        assert!(r.is_ok());
+        assert_eq!(
+            calls,
+            ["/hooks/part-a.sh", "/hooks/part-b.sh", "/hooks/consumer.sh"]
+        );
+    }
+
+    #[test]
+    fn one_satisfied_alternative_is_enough() {
+        // live-boot/disk-boot: both provide the capability, one declines.
+        let hooks = vec![
+            h("/hooks/live.sh", &["root-mounted"], &[], &[], &[]),
+            h("/hooks/disk.sh", &["root-mounted"], &[], &[], &[]),
+            h("/hooks/after.sh", &[], &[], &["root-mounted"], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[("/hooks/disk.sh", &[Outcome::Declined])]);
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(calls.last().unwrap(), "/hooks/after.sh");
+    }
+
+    #[test]
+    fn every_alternative_declining_is_a_named_failure() {
+        // The case that currently surfaces as prelude's vague "nothing
+        // mounted /sysroot": no hook was willing to be the one.
+        let hooks = vec![
+            h("/hooks/live.sh", &["root-mounted"], &[], &[], &[]),
+            h("/hooks/disk.sh", &["root-mounted"], &[], &[], &[]),
+            h("/hooks/after.sh", &[], &[], &["root-mounted"], &[]),
+        ];
+        let (r, _) = drive(
+            &hooks,
+            &[
+                ("/hooks/live.sh", &[Outcome::Declined]),
+                ("/hooks/disk.sh", &[Outcome::Declined]),
+            ],
+        );
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("every provider declined"), "{err}");
+        assert!(err.contains("root-mounted"), "{err}");
+        assert!(err.contains("/hooks/after.sh"), "{err}");
+    }
+
+    #[test]
+    fn a_declining_contributor_still_completes_the_conjunction() {
+        // "Nothing needed doing here" is a way of being done — unlike an
+        // alternative, where declining is an abstention.
+        let hooks = vec![
+            h("/hooks/consumer.sh", &[], &[], &["cap"], &[]),
+            h("/hooks/part-a.sh", &[], &["cap"], &[], &[]),
+            h("/hooks/part-b.sh", &[], &["cap"], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[("/hooks/part-b.sh", &[Outcome::Declined])]);
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(calls.contains(&"/hooks/consumer.sh".to_string()));
+    }
+
+    #[test]
+    fn a_deferred_hook_is_retried_after_something_else_progresses() {
+        // The layered-decryption shape: the inner hook cannot act until the
+        // outer one has produced its device, and says so rather than failing.
+        let hooks = vec![
+            h("/hooks/inner.sh", &[], &["unlocked"], &[], &[]),
+            h("/hooks/outer.sh", &[], &["unlocked"], &[], &[]),
+        ];
+        let (r, calls) = drive(
+            &hooks,
+            &[(
+                "/hooks/inner.sh",
+                &[Outcome::Deferred, Outcome::Satisfied],
+            )],
+        );
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(
+            calls,
+            [
+                "/hooks/inner.sh", // defers
+                "/hooks/outer.sh", // makes progress
+                "/hooks/inner.sh", // retried, succeeds
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hook_that_only_ever_defers_is_a_named_failure_not_a_spin() {
+        let hooks = vec![h("/hooks/waiting.sh", &[], &[], &[], &[])];
+        let (r, calls) = drive(&hooks, &[("/hooks/waiting.sh", &[Outcome::Deferred])]);
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("nothing left to wait for"), "{err}");
+        assert!(err.contains("/hooks/waiting.sh"), "{err}");
+        // Tried once per pass, and the pass that made no progress ends it.
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn after_orders_against_a_supplied_capability() {
+        let hooks = vec![
+            h("/hooks/late.sh", &[], &[], &[], &["net"]),
+            h("/hooks/net.sh", &["net"], &[], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[]);
+        assert!(r.is_ok());
+        assert_eq!(calls, ["/hooks/net.sh", "/hooks/late.sh"]);
+    }
+
+    #[test]
+    fn after_an_unsupplied_capability_just_runs() {
+        let hooks = vec![h("/hooks/late.sh", &[], &[], &[], &["absent"])];
+        let (r, calls) = drive(&hooks, &[]);
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(calls, ["/hooks/late.sh"]);
+    }
+
+    #[test]
+    fn after_is_satisfied_when_every_provider_declines() {
+        // `after` asks about ordering, not about the capability existing —
+        // so unlike `requires`, a fully-declined capability releases it.
+        let hooks = vec![
+            h("/hooks/late.sh", &[], &[], &[], &["net"]),
+            h("/hooks/net.sh", &["net"], &[], &[], &[]),
+        ];
+        let (r, calls) = drive(&hooks, &[("/hooks/net.sh", &[Outcome::Declined])]);
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(calls, ["/hooks/net.sh", "/hooks/late.sh"]);
+    }
+
+    #[test]
+    fn a_failing_hook_stops_the_boot_immediately() {
+        let hooks = vec![
+            h("/hooks/a.sh", &[], &[], &[], &[]),
+            h("/hooks/b.sh", &[], &[], &[], &[]),
+        ];
+        let calls = RefCell::new(Vec::<String>::new());
+        let r = schedule_hooks(&hooks, &Breakpoints::default(), |path| {
+            calls.borrow_mut().push(path.to_string());
+            if path == "/hooks/a.sh" {
+                Err(std::io::Error::other("boom"))
+            } else {
+                Ok(Outcome::Satisfied)
+            }
+        });
+        assert!(r.is_err());
+        // b.sh must not have run: a failure is not a deferral.
+        assert_eq!(calls.into_inner(), ["/hooks/a.sh"]);
+    }
 
     /// Build the (version, path) list `select_hook_seq` expects: sorted
     /// ascending by version, as `find_hook_seqs` returns it.
@@ -790,14 +1224,27 @@ mod tests {
                     provides root-mounted\n\
                     requires early-topology\n\
                     after network-up\n";
-        let order = parse_hook_seq_v2("t", body.lines()).unwrap();
-        assert_eq!(order, ["/hooks/topology.sh", "/hooks/mount-root.sh"]);
+        let hooks = parse_hook_seq_v2("t", body.lines()).unwrap();
+        assert_eq!(paths(&hooks), ["/hooks/topology.sh", "/hooks/mount-root.sh"]);
+        // The declarations are retained, not just counted — the scheduler
+        // orders from them.
+        assert_eq!(hooks[0].contributes, ["early-topology"]);
+        assert_eq!(hooks[1].provides, ["root-mounted"]);
+        assert_eq!(hooks[1].requires, ["early-topology"]);
+        assert_eq!(hooks[1].after, ["network-up"]);
+    }
+
+    #[test]
+    fn v2_takes_several_capabilities_on_one_line() {
+        let hooks =
+            parse_hook_seq_v2("t", "hook /hooks/a.sh\nrequires one two three\n".lines()).unwrap();
+        assert_eq!(hooks[0].requires, ["one", "two", "three"]);
     }
 
     #[test]
     fn v2_accepts_a_hook_with_no_declarations() {
-        let order = parse_hook_seq_v2("t", "hook /hooks/a.sh\nhook /hooks/b.sh\n".lines()).unwrap();
-        assert_eq!(order, ["/hooks/a.sh", "/hooks/b.sh"]);
+        let hooks = parse_hook_seq_v2("t", "hook /hooks/a.sh\nhook /hooks/b.sh\n".lines()).unwrap();
+        assert_eq!(paths(&hooks), ["/hooks/a.sh", "/hooks/b.sh"]);
     }
 
     #[test]
