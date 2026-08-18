@@ -25,13 +25,12 @@ land we'll grow this into a hook walker.
    points (different `st_dev`) — `/sysroot`, the moved kernel vfs — are
    automatically skipped.
 6. `chdir /sysroot` → `mount --move . /` → `chroot .` → `chdir /`.
-7. Exec the real PID 1. Candidate order: cmdline `init=` first, then
-   `/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh` (the kernel's own
-   fallback chain).
+7. Exec the real PID 1. Candidate order: cmdline `init=` first, then the Peios
+   runtime-view chain `/bin/peinit2`, `/sbin/init`, `/bin/init`, `/bin/sh`.
+   The base-topology hook creates these views before handoff.
 
-On any failure: log, sync, halt. There is no `/bin/sh` in the initramfs
-to drop to — the initramfs only contains prelude and the squashfs. Debug
-via kernel log.
+On failure, `rd.shell` opens `/usr/bin/sh` from the initramfs; without that
+debug flag prelude logs, syncs, and halts.
 
 ## Build
 
