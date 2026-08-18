@@ -54,6 +54,9 @@ extern "C" {
 }
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
+// errno 39 — a directory that still holds entries. Expected when those entries
+// are mounts the cleanup walk deliberately preserved.
+const ENOTEMPTY: i32 = 39;
 // Where a hook mounts the real root, and what prelude chroots into.
 //
 // Under /mnt because that is where the layout puts transient mounts. The
@@ -267,8 +270,21 @@ fn cleanup_old_root(root_dev: u64, path: &Path) -> std::io::Result<()> {
             if let Err(e) = cleanup_old_root(root_dev, &p) {
                 log(&format!("cleanup: descend {} failed: {e}", p.display()));
             }
-            if let Err(e) = fs::remove_dir(&p) {
-                log(&format!("cleanup: rmdir {} failed: {e}", p.display()));
+            // ENOTEMPTY here is the expected outcome for a directory whose
+            // contents are all preserved mounts — /mnt holds the rootfs
+            // overlay, the medium and the overlay's two layers, every one of
+            // them skipped above for being on another device. The parent of a
+            // mount we are deliberately keeping cannot be removed, and saying
+            // so on every boot reads like a fault.
+            //
+            // Any other errno still gets reported. A directory left non-empty
+            // by a failed unlink reaches here too, but that unlink logged its
+            // own error, so the cause is not lost by staying quiet about the
+            // consequence.
+            match fs::remove_dir(&p) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(ENOTEMPTY) => {}
+                Err(e) => log(&format!("cleanup: rmdir {} failed: {e}", p.display())),
             }
         } else if let Err(e) = fs::remove_file(&p) {
             log(&format!("cleanup: unlink {} failed: {e}", p.display()));
