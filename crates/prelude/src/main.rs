@@ -4,12 +4,12 @@
 //   - mount the kernel virtual filesystems
 //   - run the initramfs hooks, in the order mkirf baked into the hook
 //     sequence under /system/prelude
-//   - check a hook has mounted the real root at /sysroot
+//   - check a hook has mounted the real root at /mnt/rootfs
 //   - chroot into it and exec the real PID 1
 //
 // prelude is the invariant skeleton; everything deployment-specific is a
 // hook. Mounting the real root is a hook's job — prelude only provides
-// the /sysroot mountpoint and verifies the result. It does not resolve
+// the /mnt/rootfs mountpoint and verifies the result. It does not resolve
 // the hook DAG either: mkirf does that at build time and writes
 // /system/prelude/hooks.seq.<n>; prelude reads the newest version it
 // understands and runs it. See boot-design.md.
@@ -54,7 +54,13 @@ extern "C" {
 }
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
-const SYSROOT: &str = "/sysroot";
+// Where a hook mounts the real root, and what prelude chroots into.
+//
+// Under /mnt because that is where the layout puts transient mounts. The
+// initramfs root previously carried /sysroot, /sysroot.lower, /sysroot.rw and
+// /medium as top-level directories, which is namespace pollution in a root
+// that exists for two seconds and has a layout of its own.
+const ROOTFS: &str = "/mnt/rootfs";
 const FALLBACK_INITS: &[&str] = &["/bin/peinit2", "/sbin/init", "/bin/init", "/bin/sh"];
 
 // The debug shell prelude drops to under rd.shell / rd.break. dash claims
@@ -243,7 +249,7 @@ impl Breakpoints {
 
 // Recursively delete everything under `path` that lives on the rootfs's
 // device. Mount points (different st_dev) are left alone — that's how
-// /proc, /sys, /dev, and /sysroot survive the walk. `path` itself is not
+// /proc, /sys, /dev, and /mnt/rootfs survive the walk. `path` itself is not
 // removed; only its contents.
 fn cleanup_old_root(root_dev: u64, path: &Path) -> std::io::Result<()> {
     let entries = fs::read_dir(path)?;
@@ -789,35 +795,37 @@ fn boot() -> std::io::Result<()> {
     };
 
     // Phase 3: run the initramfs hooks. The kernel virtual filesystems
-    // are up — a hook may need them. prelude provides an empty /sysroot
+    // are up — a hook may need them. prelude provides an empty /mnt/rootfs
     // mountpoint; mounting a real root onto it is a hook's job (the root
     // filesystem varies by deployment, so it is never hardcoded here).
     // mkirf resolved the hook order at build time; we just run the list.
-    try_mkdir(SYSROOT);
+    // /mnt may not exist in an initramfs whose base filesystem predates it.
+    try_mkdir("/mnt");
+    try_mkdir(ROOTFS);
     run_hooks(&breaks)?;
 
-    // Phase 4: a hook must have mounted the real root at /sysroot. If it
+    // Phase 4: a hook must have mounted the real root at /mnt/rootfs. If it
     // is still on the initramfs's own device, nothing mounted it.
-    if fs::metadata(SYSROOT)?.dev() == fs::metadata("/")?.dev() {
+    if fs::metadata(ROOTFS)?.dev() == fs::metadata("/")?.dev() {
         return Err(std::io::Error::other(format!(
-            "no hook mounted a root filesystem at {SYSROOT}"
+            "no hook mounted a root filesystem at {ROOTFS}"
         )));
     }
-    log(&format!("root mounted at {SYSROOT}"));
+    log(&format!("root mounted at {ROOTFS}"));
 
     // Phase 5: move kernel vfs into the new root so the new PID 1 has them.
     // The squashfs is RO and must ship /proc, /sys, /dev as empty
     // mountpoint dirs — build-staging.sh creates them.
     for sub in &["proc", "sys", "dev"] {
         let from = format!("/{sub}");
-        let to = format!("{SYSROOT}/{sub}");
+        let to = format!("{ROOTFS}/{sub}");
         log(&format!("mount-move {from} -> {to}"));
         do_mount(&from, &to, None, MS_MOVE, None)
             .map_err(|e| std::io::Error::new(e.kind(), format!("mount-move {from}: {e}")))?;
     }
 
     // Phase 6: cleanup the old rootfs. Walks rootfs's st_dev only; the
-    // moved mounts and /sysroot all have different st_devs and stay put.
+    // moved mounts and /mnt/rootfs all have different st_devs and stay put.
     let root_dev = fs::metadata("/")?.dev();
     if let Err(e) = cleanup_old_root(root_dev, Path::new("/")) {
         log(&format!("cleanup: {e} (continuing)"));
@@ -829,21 +837,21 @@ fn boot() -> std::io::Result<()> {
     // chroot is sufficient for now: PID 1 and all descendants see the
     // squashfs as /. The kernel's "real" rootfs is unreachable but still
     // exists as a namespace bookkeeping artifact (empty after phase 6).
-    log("pivot: chdir sysroot");
-    let sysroot_c = cstr(SYSROOT);
+    log("pivot: chdir rootfs");
+    let rootfs_c = cstr(ROOTFS);
     let slash_c = cstr("/");
     unsafe {
-        if chdir(sysroot_c.as_ptr() as *const u8) != 0 {
+        if chdir(rootfs_c.as_ptr() as *const u8) != 0 {
             return Err(std::io::Error::new(
                 std::io::Error::last_os_error().kind(),
-                format!("chdir({SYSROOT}): {}", std::io::Error::last_os_error()),
+                format!("chdir({ROOTFS}): {}", std::io::Error::last_os_error()),
             ));
         }
         log("pivot: chroot");
-        if chroot(sysroot_c.as_ptr() as *const u8) != 0 {
+        if chroot(rootfs_c.as_ptr() as *const u8) != 0 {
             return Err(std::io::Error::new(
                 std::io::Error::last_os_error().kind(),
-                format!("chroot({SYSROOT}): {}", std::io::Error::last_os_error()),
+                format!("chroot({ROOTFS}): {}", std::io::Error::last_os_error()),
             ));
         }
         log("pivot: chdir /");
@@ -1034,7 +1042,7 @@ mod tests {
     #[test]
     fn every_alternative_declining_is_a_named_failure() {
         // The case that currently surfaces as prelude's vague "nothing
-        // mounted /sysroot": no hook was willing to be the one.
+        // mounted /mnt/rootfs": no hook was willing to be the one.
         let hooks = vec![
             h("/hooks/live.sh", &["root-mounted"], &[], &[], &[]),
             h("/hooks/disk.sh", &["root-mounted"], &[], &[], &[]),
