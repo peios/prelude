@@ -26,6 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
@@ -172,6 +173,10 @@ fn do_mount(
 }
 
 fn banner() {
+    // Status, not news: the banner is the first thing a blackout should remove.
+    if BLACKOUT.load(Ordering::Relaxed) {
+        return;
+    }
     let lines = [
         "",
         "  ============================================",
@@ -186,7 +191,38 @@ fn banner() {
     let _ = out.flush();
 }
 
+/// `peios.quiet=2` — the console blackout, honoured here because prelude writes
+/// to the same console peinit does and a half-silenced boot is not silence.
+///
+/// Only level 2 reaches prelude. The other half of the policy — staying out of
+/// a terminal a service owns — has no meaning before any service exists, and
+/// prelude exits before the first one starts.
+static BLACKOUT: AtomicBool = AtomicBool::new(false);
+
+/// Read the blackout preference. Must be called once /proc is mounted; before
+/// that the cmdline is unreadable and prelude logs unconditionally, which is
+/// the right default for output that would otherwise be lost.
+fn init_quiet(cmdline: &str) {
+    let blackout = cmdline
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix("peios.quiet="))
+        .next_back()
+        .is_some_and(|value| value == "2");
+    BLACKOUT.store(blackout, Ordering::Relaxed);
+}
+
+/// Ordinary progress. Silenced by `peios.quiet=2`.
 fn log(msg: &str) {
+    if BLACKOUT.load(Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("prelude: {msg}");
+}
+
+/// Something went wrong. Never silenced: a blackout is a preference about
+/// noise, not an instruction to hide a failure — and prelude's failures cost
+/// the boot.
+fn log_err(msg: &str) {
     eprintln!("prelude: {msg}");
 }
 
@@ -791,12 +827,17 @@ fn boot() -> std::io::Result<()> {
     )?;
     do_mount("devtmpfs", "/dev", Some("devtmpfs"), MS_NOSUID, None)?;
 
+    // The cmdline becomes readable here and not before — main runs ahead of any
+    // mount. Quiet is read first so the banner and everything after it can
+    // honour it; the handful of lines before this point are unconditional
+    // because prelude cannot obey a preference it has not read.
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    init_quiet(&cmdline);
+
     banner();
 
-    // Debug breakpoints: read the cmdline now that /proc is mounted. (main runs
-    // before any mount, so /proc/cmdline is not readable there — only here on.)
-    let breaks =
-        Breakpoints::from_cmdline(&fs::read_to_string("/proc/cmdline").unwrap_or_default());
+    // Debug breakpoints, from the same read.
+    let breaks = Breakpoints::from_cmdline(&cmdline);
 
     // Phase 2: figure out the target init.
     let target_init = match cmdline_init() {
@@ -931,7 +972,7 @@ fn halt() -> ! {
 
 fn main() {
     if let Err(e) = boot() {
-        log(&format!("boot failed: {e}"));
+        log_err(&format!("boot failed: {e}"));
         // rd.shell (or any rd.break) drops to a shell on failure instead of
         // halting. /proc is mounted by the time boot reaches a failure, so the
         // cmdline is readable here — it was not at process start, before any
@@ -1101,10 +1142,7 @@ mod tests {
         ];
         let (r, calls) = drive(
             &hooks,
-            &[(
-                "/hooks/inner.sh",
-                &[Outcome::Deferred, Outcome::Satisfied],
-            )],
+            &[("/hooks/inner.sh", &[Outcome::Deferred, Outcome::Satisfied])],
         );
         assert!(r.is_ok(), "{:?}", r.err());
         assert_eq!(
@@ -1204,7 +1242,10 @@ mod tests {
     #[test]
     fn the_legacy_unsuffixed_sequence_is_the_last_resort() {
         // Version 0 stands for /hooks.seq, which every numbered one outranks.
-        let found = vec![(0, "/hooks.seq".to_string()), (1, "/system/prelude/hooks.seq.1".to_string())];
+        let found = vec![
+            (0, "/hooks.seq".to_string()),
+            (1, "/system/prelude/hooks.seq.1".to_string()),
+        ];
         assert_eq!(select_hook_seq(&found).unwrap().version, 1);
 
         let only_legacy = vec![(0, "/hooks.seq".to_string())];
@@ -1249,7 +1290,10 @@ mod tests {
                     requires early-topology\n\
                     after network-up\n";
         let hooks = parse_hook_seq_v2("t", body.lines()).unwrap();
-        assert_eq!(paths(&hooks), ["/hooks/topology.sh", "/hooks/mount-root.sh"]);
+        assert_eq!(
+            paths(&hooks),
+            ["/hooks/topology.sh", "/hooks/mount-root.sh"]
+        );
         // The declarations are retained, not just counted — the scheduler
         // orders from them.
         assert_eq!(hooks[0].contributes, ["early-topology"]);
@@ -1365,5 +1409,47 @@ mod tests {
         // a termination signal lives in the low 7 bits.
         let reason = wait_failure(9).expect("a signal kill must be a failure");
         assert!(reason.contains("signal 9"), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::{init_quiet, BLACKOUT};
+    use std::sync::atomic::Ordering;
+
+    /// Only level 2 reaches prelude. Levels 0 and 1 differ in whether peinit
+    /// may write into a terminal a service owns, and prelude exits before any
+    /// service exists — so neither changes anything here.
+    #[test]
+    fn only_level_two_blacks_prelude_out() {
+        for (cmdline, expected) in [
+            ("peios.quiet=2", true),
+            ("peios.quiet=1", false),
+            ("peios.quiet=0", false),
+            ("", false),
+            ("peios.quiet=", false),
+            ("peios.quiet=yes", false),
+            ("quiet", false),
+        ] {
+            init_quiet(cmdline);
+            assert_eq!(
+                BLACKOUT.load(Ordering::Relaxed),
+                expected,
+                "cmdline {cmdline:?}",
+            );
+        }
+    }
+
+    /// Last occurrence wins, matching the kernel's own handling of a repeated
+    /// parameter and peinit's parser.
+    #[test]
+    fn the_last_quiet_token_wins() {
+        init_quiet("peios.quiet=2 root=/dev/vda peios.quiet=0");
+        assert!(!BLACKOUT.load(Ordering::Relaxed));
+
+        init_quiet("peios.quiet=0 peios.quiet=2");
+        assert!(BLACKOUT.load(Ordering::Relaxed));
+
+        init_quiet("");
     }
 }
