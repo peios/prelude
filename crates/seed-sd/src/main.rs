@@ -4,12 +4,16 @@
 // One-shot CLI used by prelude hooks (and similar early-boot / install
 // contexts) to seed the SD on a fresh tmpfs/ext4 root the moment it is
 // mounted, before KACS DENY_MISSING sees the empty inode and locks every
-// subsequent access on it. Same blob protoinit::seed_writable_sd writes; the
-// difference is invocation surface — this one's a CLI a hook script can call.
+// subsequent access on it. build_seed_sd below is the only definition of that
+// blob left in-tree (protoinit::seed_writable_sd, which this comment used to
+// pair it with, is gone), so changing it changes every seeded tree.
 //
-// The SD: owner=SYSTEM, group=SYSTEM, DACL = [Allow SYSTEM GenericAll OI|CI].
-// Inheritable so anything created under the mount picks up the same default
-// via KACS's inode_init_security inheritance.
+// The SD: owner=SYSTEM, group=SYSTEM, DACL = [Allow SYSTEM GenericAll OI|CI,
+// Allow BUILTIN\Administrators GenericAll OI|CI]. Inheritable so anything
+// created under the mount picks up the same default via KACS's
+// inode_init_security inheritance — which means this ACL is, in practice, the
+// access policy of the entire tree. See build_seed_sd for why Administrators
+// is in it and why nothing broader is.
 //
 // -r / --recursive also seeds every existing descendant. Each node is seeded
 // *before* it is read, so the walk can descend into directories that were
@@ -71,15 +75,52 @@ fn usage(prog: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Build the default Allow-SYSTEM-GenericAll (OI|CI), SYSTEM-owned SD bytes.
+/// Build the default SYSTEM-owned seed SD: Allow SYSTEM and Allow
+/// BUILTIN\Administrators, both GenericAll and both OI|CI.
+///
+/// # Why Administrators is here
+///
+/// This one ACL is the entire access policy of a freshly seeded tree: it is
+/// stamped on the root and every descendant *inherits* it, so what it grants is
+/// what every file on the system grants. While SYSTEM was the only principal
+/// that could exist, a single Allow-SYSTEM ACE was a complete answer.
+///
+/// It stopped being one the moment authd could mint a non-SYSTEM token. An
+/// administrator signing on receives `BUILTIN\Administrators` and nothing else
+/// that appears here, so under the old ACL they could traverse to a file (with
+/// `SeChangeNotifyPrivilege`, which bypasses `FILE_TRAVERSE`) and even execute
+/// it, but could not enumerate a single directory — nothing bypasses
+/// `FILE_LIST_DIRECTORY`. A usable administrator account was impossible.
+///
+/// Mirrors the default the registry already uses for the same question
+/// (`loregd/internal/sd/sd.go`): SYSTEM and Administrators full.
+///
+/// # What is deliberately *not* here
+///
+/// No `Authenticated Users` or `BUILTIN\Users` ACE, so an ordinary
+/// non-administrator still cannot read a seeded tree. That is not an oversight
+/// but a limit of the mechanism: one inheritable template covers the whole
+/// tree, so any read granted here is granted on `/root` and on every home
+/// directory as much as on `/usr`. "A readable system tree with private home
+/// directories" cannot be said in a single inherited ACL; it needs per-subtree
+/// descriptors, which is the SD materialisation `peipkg-compose` defers to
+/// image finalisation.
+///
+/// So this stays a *bootstrap* default — the narrowest thing that makes the
+/// system administrable — rather than growing into a policy it cannot express.
 fn build_seed_sd() -> Result<Vec<u8>, String> {
     use libp_sd::consts::{
         ACCESS_GENERIC_ALL, ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_OBJECT_INHERIT,
     };
-    let allow =
-        libp_sd::AceBuilder::allow(libp_sd::WellKnownSid::LocalSystem, ACCESS_GENERIC_ALL)
-            .flags(ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT);
-    let dacl = libp_sd::AclBuilder::new().ace(allow);
+    let inheritable = ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
+    let system = libp_sd::AceBuilder::allow(libp_sd::WellKnownSid::LocalSystem, ACCESS_GENERIC_ALL)
+        .flags(inheritable);
+    let administrators = libp_sd::AceBuilder::allow(
+        libp_sd::WellKnownSid::BuiltinAdministrators,
+        ACCESS_GENERIC_ALL,
+    )
+    .flags(inheritable);
+    let dacl = libp_sd::AclBuilder::new().ace(system).ace(administrators);
     libp_sd::SdBuilder::new()
         .owner(libp_sd::WellKnownSid::LocalSystem)
         .group(libp_sd::WellKnownSid::LocalSystem)
