@@ -2,7 +2,7 @@ format = "peipkg"
 
 [package]
 name = "prelude"
-version      = "{{version}}-3"
+version      = "{{version}}-4"
 architecture = "x86_64"
 # Required by peipkg. Mirrors what every crate in the workspace declares.
 license      = "MIT"
@@ -19,16 +19,20 @@ description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seed
 # bypass those rules.)
 [provides]
 init = "1"
-# The hook outcome contract this prelude honours. Level 1 is the four-way
-# answer: 0 satisfied, 69 declined, 75 deferred, anything else failed.
+# The interface between prelude and the hooks it runs. Everything a hook has
+# to agree with prelude about, versioned as one thing:
 #
-# A capability rather than a version constraint, because what a hook needs to
-# know is not "which prelude is this" but "will exit 69 be read as declining
-# or as an error?". A hook that stands aside with 69 in front of a prelude
-# that predates this contract does not merely misbehave — it HALTS THE BOOT,
-# and it is the boot it was standing aside for. Declaring it makes that a
-# compose-time failure with a readable message instead.
-hook-outcomes = "1"
+#   1  the four-way outcome: 0 satisfied, 69 declined, 75 deferred, else failed
+#   2  the real root is mounted at /mnt/rootfs (was /sysroot), and hooks are
+#      packaged under /usr/libexec/prelude/hooks.d (was /hooks)
+#
+# One capability rather than one per aspect, because every part of it fails
+# the same way and fails hard. A hook that stands aside with 69 in front of a
+# prelude predating level 1 HALTS the boot it was standing aside for; a hook
+# mounting /sysroot in front of a prelude expecting /mnt/rootfs leaves nothing
+# mounted at all. Splitting them would invite the belief that a path change is
+# not an ABI change, which is exactly the mistake that costs a boot.
+prelude-hook-abi = "2"
 
 [claims.provides.init.bin]
 target = "/usr/sbin/prelude"
