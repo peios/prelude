@@ -72,6 +72,10 @@ const FALLBACK_INITS: &[&str] = &["/bin/peinit2", "/sbin/init", "/bin/init", "/b
 // topology, so exec package storage directly; PID 1 also carries no PATH.
 const RESCUE_SHELL: &str = "/usr/bin/sh";
 
+// The seeding helper that ships beside prelude in the same package. Exec'd by
+// absolute path for the same reason as the rescue shell: no views, no PATH.
+const SEED_SD: &str = "/usr/bin/seed-sd";
+
 // The hook manifests mkirf bakes into the initramfs. The format version is
 // in the FILE NAME — /system/prelude/hooks.seq.<n> — because mkirf and
 // prelude ship in two independently versioned packages (mkirf is a
@@ -169,6 +173,41 @@ fn do_mount(
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+// Re-seed /dev with the bootstrap SD, recursively, the moment devtmpfs is
+// mounted.
+//
+// The kernel stamps the devtmpfs root SYSTEM-only at init (devtmpfs_init, see
+// pkm's devtmpfs-seed-root-sd.patch). That is plumbing, not policy: it exists
+// so kdevtmpfs can create nodes at all under DENY_MISSING, and SYSTEM-only is
+// the right descriptor for that one job. But every node kdevtmpfs has created
+// since inherited that single ACE, so on an unseeded /dev an administrator
+// cannot list the directory, open /dev/null, or touch the disk the installer
+// is about to format (PEI-208). Policy belongs in userspace, where "seed the
+// tree, then re-stamp the exceptions" is cheap; in the kernel it is nuanced
+// machinery in a high-risk place.
+//
+// seed-sd -r stamps the root and every existing node with the same descriptor
+// it puts on a fresh tmpfs root (SYSTEM and Administrators, GenericAll,
+// inheritable), so nodes that appear later — hot-plug, partitions rescanned
+// after `part` writes a table — inherit the same thing. That root descriptor
+// is deliberately conservative: whatever it grants, a raw disk nobody has met
+// yet also grants. The permissive exceptions (/dev/null and its kin, writable
+// by everyone) are per-node policy and are peinit's to stamp, not prelude's.
+//
+// Failure is logged and the boot continues. A SYSTEM-only /dev is a degraded
+// system, not an unbootable one — the recovery console still works there —
+// and refusing to boot over it would turn a permissions defect into an outage.
+fn seed_dev() {
+    match spawn_and_wait(SEED_SD, &["-r", "/dev"]) {
+        Ok(status) if (status >> 8) & 0xff == 0 => log("seeded /dev"),
+        Ok(status) => log_err(&format!(
+            "seed-sd -r /dev exited with status {}; /dev stays SYSTEM-only for nodes it could not stamp",
+            (status >> 8) & 0xff
+        )),
+        Err(e) => log_err(&format!("seed /dev: {e}; /dev stays SYSTEM-only")),
     }
 }
 
@@ -538,20 +577,26 @@ fn parse_hook_seq_v2<'a>(
     Ok(hooks)
 }
 
-// Fork-exec one hook and wait for it. The hook is a script; the kernel
-// honours its `#!/usr/bin/sh` shebang, which resolves through dash's sh claim.
-// The hook runs with PATH=/usr/bin so it finds peiosutils and friends without
-// depending on a root-level view that does not yet exist.
-// A hook that does not exit 0 fails the boot.
-fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
+// Fork-exec `path` with `args` and wait for it. The child gets the same
+// minimal environment every hook gets: TERM, and PATH=/usr/bin so it finds
+// peiosutils and friends without depending on a root-level view that does not
+// yet exist. Returns the raw wait status; callers interpret the exit code.
+//
+// A signal or a stop is surfaced as an error whatever the code would have
+// been — a child killed mid-write has not "declined" anything.
+fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
     let pid = unsafe { fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
     }
     if pid == 0 {
-        // Child: exec the hook and never fall back into prelude's pipeline.
+        // Child: exec and never fall back into prelude's pipeline.
         let p = cstr(path);
-        let argv: [*const u8; 2] = [p.as_ptr() as *const u8, core::ptr::null()];
+        let arg_cs: Vec<_> = args.iter().map(|a| cstr(a)).collect();
+        let mut argv: Vec<*const u8> = Vec::with_capacity(args.len() + 2);
+        argv.push(p.as_ptr() as *const u8);
+        argv.extend(arg_cs.iter().map(|c| c.as_ptr() as *const u8));
+        argv.push(core::ptr::null());
         let term = cstr("TERM=linux");
         let path_env = cstr("PATH=/usr/bin");
         let envp: [*const u8; 3] = [
@@ -561,7 +606,7 @@ fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
         ];
         unsafe { execve(p.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
         log(&format!(
-            "hook {path}: exec failed: {}",
+            "{path}: exec failed: {}",
             std::io::Error::last_os_error(),
         ));
         unsafe { _exit(127) };
@@ -570,12 +615,19 @@ fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
     if unsafe { waitpid(pid, &mut status, 0) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // A signal or a stop is a failure whatever the code would have been —
-    // a hook killed mid-write has not "declined" anything.
     if status & 0x7f != 0 {
         let reason = wait_failure(status).unwrap_or_else(|| "terminated abnormally".to_string());
-        return Err(std::io::Error::other(format!("hook {path}: {reason}")));
+        return Err(std::io::Error::other(format!("{path}: {reason}")));
     }
+    Ok(status)
+}
+
+// Run one hook and wait for it. The hook is a script; the kernel honours its
+// `#!/usr/bin/sh` shebang, which resolves through dash's sh claim.
+// A hook that does not exit 0 fails the boot.
+fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
+    let status = spawn_and_wait(path, &[])
+        .map_err(|e| std::io::Error::new(e.kind(), format!("hook {e}")))?;
     match (status >> 8) & 0xff {
         0 => Ok(Outcome::Satisfied),
         HOOK_DECLINED => Ok(Outcome::Declined),
@@ -826,6 +878,7 @@ fn boot() -> std::io::Result<()> {
         None,
     )?;
     do_mount("devtmpfs", "/dev", Some("devtmpfs"), MS_NOSUID, None)?;
+    seed_dev();
 
     // The cmdline becomes readable here and not before — main runs ahead of any
     // mount. Quiet is read first so the banner and everything after it can

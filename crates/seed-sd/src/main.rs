@@ -1,7 +1,7 @@
-// seed-sd: write a default Allow-SYSTEM-GenericAll SD onto a path (and, with
-// -r, onto every existing descendant too).
+// seed-sd: write the default seed SD onto a path (and, with -r, onto every
+// existing descendant too).
 //
-// One-shot CLI used by prelude hooks (and similar early-boot / install
+// One-shot CLI used by prelude and its hooks (and similar early-boot / install
 // contexts) to seed the SD on a fresh tmpfs/ext4 root the moment it is
 // mounted, before KACS DENY_MISSING sees the empty inode and locks every
 // subsequent access on it. build_seed_sd below is the only definition of that
@@ -22,13 +22,32 @@
 // what an installer wants after mkfs+mount: one call makes the whole target
 // tree managed and writable.
 //
-// Requires SeRestorePrivilege in the caller's token: each target's existing
-// SD is MISSING (that's the whole point of seeding), and KACS only allows
-// replacing a MISSING SD via that privilege.
+// It is also what prelude wants for /dev. The kernel seeds the devtmpfs root
+// SYSTEM-only before any userspace exists (that is plumbing: it lets
+// kdevtmpfs create nodes under DENY_MISSING), and every node created since has
+// inherited that one ACE. Re-seeding the root alone would fix nothing already
+// there — KACS computes inheritance once, at creation — so the existing nodes
+// are re-stamped explicitly. Nodes that appear later inherit from the new
+// root.
+//
+// Symlinks are stamped as themselves and never followed. That is not merely
+// "don't leave the tree": /dev/core points at /proc/kcore and /dev/stdin at
+// /proc/self/fd/0, and /proc is UNMANAGED, so following would fail every such
+// link — while the link inode itself is what `ls -l` has to stat, and it needs
+// the seed as much as anything else in the tree.
+//
+// A recursive walk is best-effort: a node that cannot be stamped is reported
+// and the walk continues, because one odd inode is no reason to leave the rest
+// of a tree locked. The exit status still says whether everything succeeded.
+//
+// Requires SeRestorePrivilege in the caller's token where a target's existing
+// SD is MISSING (the fresh-mount case): KACS only allows replacing a MISSING
+// SD via that privilege. Re-stamping a node that already has an SD needs the
+// ordinary WRITE_DAC / WRITE_OWNER rights, which SYSTEM holds as owner.
 //
 // Usage: seed-sd [-r|--recursive] <path>
 //
-// Exits 0 on success, 2 on usage error, 1 on syscall/build failure.
+// Exits 0 on success, 2 on usage error, 1 if any node could not be seeded.
 
 use std::process::ExitCode;
 
@@ -56,16 +75,21 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = if recursive {
-        seed_recursive(&path, &sd)
-    } else {
-        seed_one(&path, &sd)
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("seed-sd: {e}");
+    if recursive {
+        let failures = seed_recursive(&path, &sd);
+        if failures == 0 {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("seed-sd: {failures} node(s) under {path} could not be seeded");
             ExitCode::FAILURE
+        }
+    } else {
+        match seed_one(&path, &sd) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("seed-sd: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -95,6 +119,11 @@ fn usage(prog: &str) -> ExitCode {
 /// Mirrors the default the registry already uses for the same question
 /// (`loregd/internal/sd/sd.go`): SYSTEM and Administrators full.
 ///
+/// peinit's `PHASE1_SEED_SDDL` (`src/init/linux/mounts.rs`) is a hand copy of
+/// this descriptor for the mounts peinit creates itself. The two MUST stay
+/// identical; the last time they drifted, Administrators was added here and
+/// not there (PEI-223).
+///
 /// # What is deliberately *not* here
 ///
 /// No `Authenticated Users` or `BUILTIN\Users` ACE, so an ordinary
@@ -105,6 +134,11 @@ fn usage(prog: &str) -> ExitCode {
 /// directories" cannot be said in a single inherited ACL; it needs per-subtree
 /// descriptors, which is the SD materialisation `peipkg-compose` defers to
 /// image finalisation.
+///
+/// The same limit is why this is the right descriptor for `/dev`'s root even
+/// though `/dev/null` must be writable by everyone: whatever the root grants,
+/// a hot-plugged raw disk inherits. The permissive exceptions are stamped on
+/// the individual static nodes by peinit, not expressed here.
 ///
 /// So this stays a *bootstrap* default — the narrowest thing that makes the
 /// system administrable — rather than growing into a policy it cannot express.
@@ -129,31 +163,66 @@ fn build_seed_sd() -> Result<Vec<u8>, String> {
         .map_err(|e| format!("{e:?}"))
 }
 
-/// Stamp the seed SD (owner + group + dacl) onto one path.
+/// Stamp the seed SD (owner + group + dacl) onto one path. A symlink is
+/// stamped as itself, never followed.
 fn seed_one(path: &str, sd: &[u8]) -> Result<(), String> {
     let info = libp_sd::SecurityInfo::owner().with_group().with_dacl();
-    libp_sd::set_sd(&libp_sd::SdTarget::path(path), info, sd)
-        .map_err(|e| format!("set_sd {path}: {e:?}"))
+    let target = libp_sd::SdTarget::Path {
+        dirfd: libp_sd::raw::FDCWD,
+        path,
+        no_follow_symlinks: true,
+    };
+    libp_sd::set_sd(&target, info, sd).map_err(|e| format!("set_sd {path}: {e:?}"))
 }
 
-/// Seed `path`, then descend into it. `path` is seeded *before* it is read, so
-/// a directory that was MISSING (and thus inaccessible) becomes readable the
-/// instant it is seeded and the walk can enter it. Symlinks are seeded but not
-/// followed (we don't descend out of the tree).
-fn seed_recursive(path: &str, sd: &[u8]) -> Result<(), String> {
-    seed_one(path, sd)?;
-    let md = std::fs::symlink_metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+/// Seed `path`, then descend into it if it is a directory. `path` is seeded
+/// *before* it is read, so a directory that was MISSING (and thus
+/// inaccessible) becomes readable the instant it is seeded and the walk can
+/// enter it. Symlinks are stamped but never followed, so the walk cannot leave
+/// the tree.
+///
+/// Best-effort: every failure is reported on stderr and counted, and the walk
+/// goes on. Returns the number of nodes that could not be seeded. A directory
+/// that could not be read counts once and is not descended into.
+fn seed_recursive(path: &str, sd: &[u8]) -> usize {
+    let mut failures = 0;
+    if let Err(e) = seed_one(path, sd) {
+        eprintln!("seed-sd: {e}");
+        failures += 1;
+    }
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) => {
+            eprintln!("seed-sd: stat {path}: {e}");
+            return failures + 1;
+        }
+    };
     if !md.is_dir() {
-        return Ok(());
+        return failures;
     }
-    let entries = std::fs::read_dir(path).map_err(|e| format!("read_dir {path}: {e}"))?;
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("seed-sd: read_dir {path}: {e}");
+            return failures + 1;
+        }
+    };
     for entry in entries {
-        let entry = entry.map_err(|e| format!("read_dir {path}: {e}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("seed-sd: read_dir {path}: {e}");
+                failures += 1;
+                continue;
+            }
+        };
         let child = entry.path();
-        let child = child
-            .to_str()
-            .ok_or_else(|| format!("non-UTF-8 path under {path}"))?;
-        seed_recursive(child, sd)?;
+        let Some(child) = child.to_str() else {
+            eprintln!("seed-sd: non-UTF-8 path under {path}");
+            failures += 1;
+            continue;
+        };
+        failures += seed_recursive(child, sd);
     }
-    Ok(())
+    failures
 }
