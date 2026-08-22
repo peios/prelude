@@ -2,7 +2,7 @@ format = "peipkg"
 
 [package]
 name = "prelude"
-version      = "{{version}}-6"
+version      = "{{version}}-7"
 architecture = "x86_64"
 # Required by peipkg. Mirrors what every crate in the workspace declares.
 license      = "MIT"
