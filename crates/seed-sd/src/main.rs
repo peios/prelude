@@ -45,7 +45,20 @@
 // SD via that privilege. Re-stamping a node that already has an SD needs the
 // ordinary WRITE_DAC / WRITE_OWNER rights, which SYSTEM holds as owner.
 //
-// Usage: seed-sd [-r|--recursive] <path>
+// --sddl overrides the built-in descriptor with one given in SDDL. The
+// built-in remains the default and remains the *bootstrap* descriptor
+// (build_seed_sd): the narrowest thing that makes a fresh tree administrable.
+// A caller that needs the access policy of a *running* system — the live
+// root's overlay upper, an installer's target root — passes its own.
+//
+// Keeping those two distinct is not tidiness. The built-in is also what stamps
+// /dev (prelude's seed_dev), where every ACE is inherited by whatever block
+// device is hot-plugged next; a read ACE for Everyone there is every
+// filesystem ACL on the machine bypassed by opening the raw disk. So the
+// default must stay narrow, and the widening happens at the call site that
+// wants it.
+//
+// Usage: seed-sd [-r|--recursive] [--sddl <descriptor>] <path>
 //
 // Exits 0 on success, 2 on usage error, 1 if any node could not be seeded.
 
@@ -53,12 +66,21 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut recursive = false;
+    let mut sddl: Option<String> = None;
     let mut path: Option<String> = None;
     let mut args = std::env::args();
     let prog = args.next().unwrap_or_else(|| "seed-sd".into());
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-r" | "--recursive" => recursive = true,
+            // A missing value is a usage error rather than an empty
+            // descriptor: silently seeding the built-in default when the
+            // caller asked for something else is the failure this whole flag
+            // exists to make impossible.
+            "--sddl" => match args.next() {
+                Some(value) => sddl = Some(value),
+                None => return usage(&prog),
+            },
             _ if path.is_none() => path = Some(arg),
             _ => return usage(&prog),
         }
@@ -67,7 +89,7 @@ fn main() -> ExitCode {
         return usage(&prog);
     };
 
-    let sd = match build_seed_sd() {
+    let sd = match build_sd(sddl.as_deref()) {
         Ok(sd) => sd,
         Err(e) => {
             eprintln!("seed-sd: build SD: {e}");
@@ -95,8 +117,25 @@ fn main() -> ExitCode {
 }
 
 fn usage(prog: &str) -> ExitCode {
-    eprintln!("usage: {prog} [-r|--recursive] <path>");
+    eprintln!("usage: {prog} [-r|--recursive] [--sddl <descriptor>] <path>");
     ExitCode::from(2)
+}
+
+/// The descriptor to stamp: the caller's, compiled from SDDL, or the built-in
+/// bootstrap default when they did not ask for one.
+///
+/// A descriptor that does not parse is a hard failure. Falling back to the
+/// default would stamp a *narrower* policy than the caller asked for, and the
+/// symptom of that arrives much later and somewhere else — a service that
+/// cannot reach the filesystem, with nothing pointing back to a typo here.
+fn build_sd(sddl: Option<&str>) -> Result<Vec<u8>, String> {
+    match sddl {
+        Some(text) => libp_sd::sddl::parse(text)
+            .map_err(|e| format!("parse {text:?}: {e:?}"))?
+            .build()
+            .map_err(|e| format!("build {text:?}: {e:?}")),
+        None => build_seed_sd(),
+    }
 }
 
 /// Build the default SYSTEM-owned seed SD: Allow SYSTEM and Allow
@@ -142,6 +181,9 @@ fn usage(prog: &str) -> ExitCode {
 ///
 /// So this stays a *bootstrap* default — the narrowest thing that makes the
 /// system administrable — rather than growing into a policy it cannot express.
+/// A caller that needs the access policy of a running system passes `--sddl`
+/// instead of widening this, precisely so the /dev case above does not inherit
+/// the widening along with it.
 fn build_seed_sd() -> Result<Vec<u8>, String> {
     use libp_sd::consts::{
         ACCESS_GENERIC_ALL, ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_OBJECT_INHERIT,
