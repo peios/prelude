@@ -186,7 +186,8 @@ fn build_sd(sddl: Option<&str>) -> Result<Vec<u8>, String> {
 /// the widening along with it.
 fn build_seed_sd() -> Result<Vec<u8>, String> {
     use libp_sd::consts::{
-        ACCESS_GENERIC_ALL, ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_OBJECT_INHERIT,
+        ACCESS_GENERIC_ALL, ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY,
+        ACE_FLAG_OBJECT_INHERIT,
     };
     let inheritable = ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
     let system = libp_sd::AceBuilder::allow(libp_sd::WellKnownSid::LocalSystem, ACCESS_GENERIC_ALL)
@@ -196,7 +197,32 @@ fn build_seed_sd() -> Result<Vec<u8>, String> {
         ACCESS_GENERIC_ALL,
     )
     .flags(inheritable);
-    let dacl = libp_sd::AclBuilder::new().ace(system).ace(administrators);
+    // Whoever creates an object gets full control of it. Inherit-only, so it
+    // grants nothing on the node it sits on; KACS resolves it per created
+    // object and carries the rule onward down each container.
+    //
+    // Without it a non-SYSTEM principal can create a file it cannot read back.
+    // The two ACEs above are inheritable, so a created file arrives with a
+    // non-empty DACL naming only SYSTEM and Administrators — and a token's
+    // default DACL is consulted only when inheritance yields nothing at all,
+    // so it never gets a look in (PEI-546).
+    //
+    // This one is not a widening. It never names a principal: it grants the
+    // creator rights over its own object and nobody rights over anybody
+    // else's, which is why it belongs in the bootstrap descriptor when an
+    // Everyone ACE does not.
+    //
+    // Spelled as a literal SID because `WellKnownSid` has no CREATOR OWNER
+    // variant and neither SDDL vocabulary has a `CO` alias.
+    let creator_owner_sid = libp_sd::sddl::parse_sid("S-1-3-0")
+        .map_err(|e| format!("CREATOR OWNER sid: {e:?}"))?;
+    let creator_owner =
+        libp_sd::AceBuilder::allow(creator_owner_sid, ACCESS_GENERIC_ALL)
+            .flags(inheritable | ACE_FLAG_INHERIT_ONLY);
+    let dacl = libp_sd::AclBuilder::new()
+        .ace(system)
+        .ace(administrators)
+        .ace(creator_owner);
     libp_sd::SdBuilder::new()
         .owner(libp_sd::WellKnownSid::LocalSystem)
         .group(libp_sd::WellKnownSid::LocalSystem)
