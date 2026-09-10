@@ -1,54 +1,9 @@
+# Shared metadata for the runtime, debug, and corresponding-source family.
 format = "peipkg"
 
 [package]
-name = "prelude"
-version      = "{{version}}-8"
-architecture = "x86_64"
-# Required by peipkg. Mirrors what every crate in the workspace declares.
-license      = "MIT"
-# prelude is the initramfs's PID 1 — its home is the initramfs root. default_root
-# places it there for top-level installs/compose without an explicit root=, so
-# nothing has to spell out where prelude goes.
-default_root = "initramfs"
-description  = "Peios initramfs runtime - prelude PID 1 and seed-sd KACS SD seeding helper"
-
-# prelude is the holder of the `init` role: the kernel execs /init as PID 1 at
-# the root of the unpacked initramfs. The claim materialises /init -> the
-# installed prelude binary as a manager-reconciled symlink. (/init sits at the
-# filesystem root, outside the §3.4 install-path layout — claims deliberately
-# bypass those rules.)
-[provides]
-init = "1"
-# The interface between prelude and the hooks it runs. Everything a hook has
-# to agree with prelude about, versioned as one thing:
-#
-#   1  the four-way outcome: 0 satisfied, 69 declined, 75 deferred, else failed
-#   2  the real root is mounted at /mnt/rootfs (was /sysroot), and hooks are
-#      packaged under /usr/libexec/prelude/hooks.d (was /hooks)
-#
-# One capability rather than one per aspect, because every part of it fails
-# the same way and fails hard. A hook that stands aside with 69 in front of a
-# prelude predating level 1 HALTS the boot it was standing aside for; a hook
-# mounting /sysroot in front of a prelude expecting /mnt/rootfs leaves nothing
-# mounted at all. Splitting them would invite the belief that a path change is
-# not an ABI change, which is exactly the mistake that costs a boot.
-prelude-hook-abi = "2"
-
-[claims.provides.init.bin]
-target = "/usr/sbin/prelude"
-path   = "/init"
-
-# prelude runs the initramfs hooks, which are #!/usr/bin/sh scripts, so it needs
-# a shell at runtime. Depending on the `sh` capability (dash provides it) pulls a
-# shell into prelude's root — the initramfs — so the manifest needn't list one.
-# (>= 1 = POSIX-sh capability level, matching dash's `provides sh = "1"`.)
-[dependencies]
-sh = ">= 1"
-
-# Build-refs (leading ':' = the "main" build target's stage output) — cargo
-# writes these under the build stage, so they resolve there, not the source
-# tree. A bare literal path would resolve against the recipe root and trip the
-# static-payload preflight before the build has produced them.
-[files]
-":target/x86_64-unknown-linux-musl/release/prelude" = "usr/sbin/prelude"
-":target/x86_64-unknown-linux-musl/release/seed-sd" = "usr/bin/seed-sd"
+version       = "{{version}}-1"
+architecture  = "x86_64"
+license       = "MIT AND Apache-2.0 AND Unicode-3.0"
+license_class = "free"
+homepage      = "https://github.com/peios/prelude"

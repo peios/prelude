@@ -1,0 +1,46 @@
+[package]
+name.style    = "reverse-dns"
+license       = "spdx"
+license_class = true
+homepage      = "https"
+description   = 80
+dependencies  = "consistent"
+architecture  = "consistent"
+
+[build]
+dependencies.providers = ["peipkg", "apt"]
+test = true
+
+[payload]
+junk                 = true
+scripts              = true
+symlinks.dangling    = "forbidden"
+symlinks.absolute    = "forbidden"
+filenames            = "portable"
+special_files        = "forbidden"
+manpages.required    = true
+manpages.compression = "gzip"
+pkgconfig            = true
+license_file         = "usr/share/licenses/{{name}}/"
+dirs.lib             = ["lib", "lib64", "usr/lib", "usr/lib64", "usr/lib/x86_64-linux-peios"]
+
+[split]
+devel.packages = "*-devel"
+
+[elf]
+pie         = true
+stack       = "non-exec"
+relro       = "full"
+relr        = true
+cet         = true
+rpath       = "forbidden"
+textrel     = "forbidden"
+stripped    = true
+debuginfo   = "{{name}}-debuginfo"
+build_paths = "forbidden"
+soname      = true
+
+[allow]
+"payload.manpages.required" = "Prelude and seed-sd are internal initramfs implementation interfaces, not interactive operator commands"
+"elf.relr" = "The self-contained static musl PIE has no dynamic shared-library relocation table to compress"
+"elf.cet" = "Rust's self-contained musl target does not emit GNU CET property notes; the binaries remain static PIE with NX and full RELRO"
