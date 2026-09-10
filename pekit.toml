@@ -41,7 +41,7 @@ if versions != [expected]:
 '
 
 # Preserve the static initramfs contract and keep checkout/build paths out of
-# split symbols. This deliberately replaces the workspace RUSTFLAGS: rust-lld
+# split symbols. This deliberately replaces the workspace RUSTFLAGS: ld.lld
 # is invoked directly for the self-contained musl target and therefore accepts
 # raw GNU-ld arguments, not the `-Wl,` driver syntax used by ordinary Peios
 # Rust packages. The security policy is otherwise equivalent.
@@ -206,7 +206,8 @@ test "$actual" = '[  OK  ] fixture: mounted'
 "dev.peios.build-essentials" = "*"
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
-"org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
+"org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
+"org.llvm.lld" = ">= 22, < 23"
 "org.gnu.binutils" = "*"
 "org.gnu.findutils" = "*"
 "org.gnu.grep" = "*"
@@ -242,7 +243,7 @@ cargo test --workspace --locked --offline \
 [test.dependencies.peipkg]
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
-"org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
+"org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
 "org.gnu.findutils" = "*"
 "org.gnu.grep" = "*"
 
