@@ -7,12 +7,9 @@ default_root = "initramfs"
 description  = "Peios initramfs runtime, boot-hook scheduler, and SD seeding helper"
 
 [provides]
-prelude = "{{version}}"
 init = "1"
 prelude-hook-abi = "3"
 
-[replaces]
-prelude = "<= 0.0.1-9"
 
 [claims.provides.init.bin]
 target = "/usr/sbin/prelude"
