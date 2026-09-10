@@ -1,0 +1,30 @@
+# Prelude and seed-sd are one inseparable initramfs trust domain: Prelude calls
+# the helper while establishing the filesystem policy that makes later hooks
+# safe, and the helper has no supported lifecycle without that caller.
+[package]
+name         = "dev.peios.prelude"
+default_root = "initramfs"
+description  = "Peios initramfs runtime, boot-hook scheduler, and SD seeding helper"
+
+[provides]
+prelude = "{{version}}"
+init = "1"
+prelude-hook-abi = "3"
+
+[replaces]
+prelude = "<= 0.0.1-9"
+
+[claims.provides.init.bin]
+target = "/usr/sbin/prelude"
+path   = "/init"
+
+[dependencies]
+sh = ">= 1"
+
+[files]
+"@source:LICENSE" = "usr/share/licenses/dev.peios.prelude/LICENSE"
+":usr/share/licenses/dev.peios.prelude/Apache-2.0.txt" = "usr/share/licenses/dev.peios.prelude/Apache-2.0.txt"
+":usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt" = "usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt"
+":usr/sbin/prelude" = "usr/sbin/prelude"
+":usr/bin/seed-sd" = "usr/bin/seed-sd"
+":usr/libexec/prelude/hook-log.sh" = "usr/libexec/prelude/hook-log.sh"

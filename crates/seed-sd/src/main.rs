@@ -214,11 +214,10 @@ fn build_seed_sd() -> Result<Vec<u8>, String> {
     //
     // Spelled as a literal SID because `WellKnownSid` has no CREATOR OWNER
     // variant and neither SDDL vocabulary has a `CO` alias.
-    let creator_owner_sid = libp_sd::sddl::parse_sid("S-1-3-0")
-        .map_err(|e| format!("CREATOR OWNER sid: {e:?}"))?;
-    let creator_owner =
-        libp_sd::AceBuilder::allow(creator_owner_sid, ACCESS_GENERIC_ALL)
-            .flags(inheritable | ACE_FLAG_INHERIT_ONLY);
+    let creator_owner_sid =
+        libp_sd::sddl::parse_sid("S-1-3-0").map_err(|e| format!("CREATOR OWNER sid: {e:?}"))?;
+    let creator_owner = libp_sd::AceBuilder::allow(creator_owner_sid, ACCESS_GENERIC_ALL)
+        .flags(inheritable | ACE_FLAG_INHERIT_ONLY);
     let dacl = libp_sd::AclBuilder::new()
         .ace(system)
         .ace(administrators)

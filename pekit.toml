@@ -1,25 +1,207 @@
 out_dir = "out"
 
-# NixOS toolchain note: the default cargo/rustc come from a nix-shimmed
-# rustc-wrapper that can't find the musl rustlib, so builds go straight
-# to the rustup-managed binaries (see the old Makefile header).
+# One immutable source artifact covers Prelude, seed-sd, the hook logging ABI,
+# and the exact vendored Rust dependency closure used to build the binaries.
+[source_package]
+name = "dev.peios.prelude-source"
 
-[env]
-TC = "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
-PATH = "$TC:$PATH"
-CARGO = "$TC/cargo"
-RUSTC = "$TC/rustc"
+[build.main]
+command = '''
+set -eu
 
-# pekit's build contract: artifacts must land in $PEKIT_OUT (the build-target
-# stage), which is where the package's ':'-prefixed build-refs read from. Plain
-# `cargo build` writes to ./target in the source tree, leaving the stage empty —
-# so point cargo's target-dir at $PEKIT_OUT/target. (This also keeps the real
-# source tree clean under --local, where the build runs in-place.)
-[build]
-command = 'cargo build --release --target-dir "$PEKIT_OUT/target"'
+SRC=$(pwd -P)
+TARGET=x86_64-unknown-linux-musl
+DEBUG_ROOT="$PEKIT_OUT/usr/src/debug/dev.peios.prelude"
+
+for tool in cargo rustc python3 cmp cp find grep readelf objcopy strip debugedit; do
+  command -v "$tool" >/dev/null || {
+    echo "prelude: missing required build tool: $tool" >&2
+    exit 1
+  }
+done
+
+# Cargo must build from an empty home with the committed vendor directory
+# alone. This catches an incomplete Cargo.lock/vendor refresh before payload
+# staging.
+export CARGO_HOME="$PEKIT_OUT/cargo-home"
+mkdir -p "$CARGO_HOME"
+test -d "$SRC/vendor"
+test -n "$(find "$SRC/vendor" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+
+# A release tag and both workspace crates describe one version.
+cargo metadata --locked --offline --no-deps --format-version 1 |
+  python3 -c '
+import json, os, sys
+metadata = json.load(sys.stdin)
+members = set(metadata["workspace_members"])
+versions = sorted({p["version"] for p in metadata["packages"] if p["id"] in members})
+expected = os.environ["PEKIT_VERSION"]
+if versions != [expected]:
+    raise SystemExit(f"prelude: workspace versions {versions!r} do not equal package version {expected!r}")
+'
+
+# Preserve the static initramfs contract and keep checkout/build paths out of
+# split symbols. This deliberately replaces the workspace RUSTFLAGS: rust-lld
+# is invoked directly for the self-contained musl target and therefore accepts
+# raw GNU-ld arguments, not the `-Wl,` driver syntax used by ordinary Peios
+# Rust packages. The security policy is otherwise equivalent.
+export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C link-arg=--build-id=sha1 --remap-path-prefix=$PEKIT_WORKSPACE_ROOT=/usr/src/debug/dev.peios.prelude/.workspace --remap-path-prefix=$PEKIT_OUT_BASE=/usr/src/debug/dev.peios.prelude/.build --remap-path-prefix=$SRC=/usr/src/debug/dev.peios.prelude"
+
+# Test the exact graph and prove independent target directories are identical
+# before stripping either copy.
+cargo test --release --workspace --locked --offline \
+  --target "$TARGET" --target-dir "$PEKIT_OUT/test-target"
+for tree in build-a build-b; do
+  cargo build --release --workspace --locked --offline \
+    --target "$TARGET" --target-dir "$PEKIT_OUT/$tree"
+done
+for bin in prelude seed-sd; do
+  cmp "$PEKIT_OUT/build-a/$TARGET/release/$bin" \
+      "$PEKIT_OUT/build-b/$TARGET/release/$bin"
+done
+
+mkdir -p "$PEKIT_OUT/usr/sbin" "$PEKIT_OUT/usr/bin" \
+             "$PEKIT_OUT/usr/libexec/prelude" \
+             "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude"
+cp "$PEKIT_OUT/build-a/$TARGET/release/prelude" "$PEKIT_OUT/usr/sbin/prelude"
+cp "$PEKIT_OUT/build-a/$TARGET/release/seed-sd" "$PEKIT_OUT/usr/bin/seed-sd"
+cp "$SRC/src/hook-log.sh" "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
+chmod 0755 "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"
+chmod 0644 "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
+
+# Prelude itself is MIT. For OR-licensed Rust dependencies the binary elects
+# Apache-2.0; unicode-ident additionally requires Unicode-3.0.
+cp "$SRC/LICENSE" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/LICENSE"
+cp "$SRC/vendor/proc-macro2/LICENSE-APACHE" \
+   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Apache-2.0.txt"
+cp "$SRC/vendor/unicode-ident/LICENSE-UNICODE" \
+   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt"
+
+split_debug() {
+  elf=$1
+  debugedit -b "$SRC" -d /usr/src/debug/dev.peios.prelude -n "$elf"
+  build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
+  test -n "$build_id" || {
+    echo "prelude: $elf has no GNU build ID" >&2
+    exit 1
+  }
+  first=$(printf %s "$build_id" | cut -c1-2)
+  rest=$(printf %s "$build_id" | cut -c3-)
+  debug="$PEKIT_OUT/debug/usr/lib/debug/.build-id/$first/$rest.debug"
+  mkdir -p "$(dirname "$debug")"
+  objcopy --only-keep-debug "$elf" "$debug"
+  strip --strip-unneeded "$elf"
+  objcopy --add-gnu-debuglink="$debug" "$elf"
+}
+
+split_debug "$PEKIT_OUT/usr/sbin/prelude"
+split_debug "$PEKIT_OUT/usr/bin/seed-sd"
+
+mkdir -p "$DEBUG_ROOT"
+# Cargo depfiles enumerate the exact source closure compiled into the release
+# binaries. Shipping that closure avoids unrelated vendored examples/tests and
+# keeps debugsource aligned with this target and feature selection.
+find "$PEKIT_OUT/build-a" -type f -name '*.d' -print | LC_ALL=C sort |
+while IFS= read -r origin; do
+  sed -n '1p' "$origin"
+done | tr ' ' '\n' | sed 's/:$//' | LC_ALL=C sort -u |
+while IFS= read -r origin; do
+  case "$origin" in
+    *.rs) ;;
+    *) continue ;;
+  esac
+  case "$origin" in
+    "$PEKIT_OUT_BASE"/*)
+      rel=.build/${origin#"$PEKIT_OUT_BASE"/}
+      ;;
+    "$SRC"/*)
+      rel=${origin#"$SRC"/}
+      ;;
+    crates/*|vendor/*)
+      rel=$origin
+      origin="$SRC/$origin"
+      ;;
+    *)
+      continue
+      ;;
+  esac
+  if test -f "$origin"; then
+    mkdir -p "$DEBUG_ROOT/$(dirname "$rel")"
+    cp "$origin" "$DEBUG_ROOT/$rel"
+  fi
+done
+test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
+
+# Fail closed on static PIE, hardening, split-debug linkage, and path leakage.
+for elf in "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"; do
+  readelf -h "$elf" | grep -Eq 'Type:[[:space:]]+DYN'
+  readelf -lW "$elf" | grep -q 'GNU_RELRO'
+  readelf -lW "$elf" | grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'
+  ! readelf -lW "$elf" | grep -q ' INTERP '
+  readelf -dW "$elf" | grep -q 'BIND_NOW'
+  readelf -dW "$elf" | grep -Eq 'FLAGS_1.*PIE'
+  ! readelf -dW "$elf" | grep -Eq '(NEEDED|RPATH|RUNPATH)'
+  ! readelf -SW "$elf" | grep -q '\.debug_info'
+
+  build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
+  debug="$PEKIT_OUT/debug/usr/lib/debug/.build-id/$(printf %s "$build_id" | cut -c1-2)/$(printf %s "$build_id" | cut -c3-).debug"
+  test -s "$debug"
+  readelf -SW "$debug" | grep -q '\.debug_info'
+  test "$(readelf -n "$debug" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)" = "$build_id"
+  for forbidden in "$SRC" "$PEKIT_OUT_BASE" "$PEKIT_WORKSPACE_ROOT"; do
+    ! grep -aF "$forbidden" "$elf" "$debug" >/dev/null
+  done
+done
+
+# The shell helper is ABI payload. Pin its installed syntax and column format.
+/usr/bin/sh -n "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
+actual=$(
+  . "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
+  hook_log_init fixture
+  HOOK_LOG_COLOUR=0
+  log_ok mounted
+)
+test "$actual" = '[  OK  ] fixture: mounted'
+'''
+
+[build.main.dependencies.peipkg]
+"dev.peios.build-essentials" = "*"
+"org.git.kernel.dash" = "*"
+"org.rust-lang.rust" = ">= 1.98.1"
+"org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
+"org.gnu.binutils" = "*"
+"org.sourceware.debugedit" = "*"
+"org.python.python3" = "*"
+
+[build.main.dependencies.apt]
+build-essential = "*"
+dash = "*"
+cargo = "*"
+rustc = "*"
+binutils = "*"
+debugedit = "*"
+python3 = "*"
+musl-tools = "*"
 
 [test]
-command = "cargo test"
+command = '''
+set -eu
+export CARGO_HOME="$PEKIT_OUT/cargo-home"
+mkdir -p "$CARGO_HOME"
+cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl
+/usr/bin/sh -n src/hook-log.sh
+'''
+
+[test.dependencies.peipkg]
+"org.git.kernel.dash" = "*"
+"org.rust-lang.rust" = ">= 1.98.1"
+"org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
+
+[test.dependencies.apt]
+dash = "*"
+cargo = "*"
+rustc = "*"
+musl-tools = "*"
 
 [clean]
 command = "cargo clean"
