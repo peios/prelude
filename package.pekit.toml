@@ -4,6 +4,6 @@ format = "peipkg"
 [package]
 version       = "{{version}}-1"
 architecture  = "x86_64"
-license       = "MIT AND Apache-2.0 AND Unicode-3.0"
+license       = "MIT AND Apache-2.0 WITH LLVM-exception AND Unicode-3.0"
 license_class = "free"
 homepage      = "https://github.com/peios/prelude"
