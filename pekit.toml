@@ -13,7 +13,7 @@ SRC=$(pwd -P)
 TARGET=x86_64-unknown-linux-musl
 DEBUG_ROOT="$PEKIT_OUT/usr/src/debug/dev.peios.prelude"
 
-for tool in cargo rustc python3 cmp cp find grep readelf objcopy strip debugedit; do
+for tool in cargo rustc python3 cmp cp find grep ar readelf objcopy strip debugedit; do
   command -v "$tool" >/dev/null || {
     echo "prelude: missing required build tool: $tool" >&2
     exit 1
@@ -45,14 +45,49 @@ if versions != [expected]:
 # is invoked directly for the self-contained musl target and therefore accepts
 # raw GNU-ld arguments, not the `-Wl,` driver syntax used by ordinary Peios
 # Rust packages. The security policy is otherwise equivalent.
-export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C link-arg=--build-id=sha1 --remap-path-prefix=$PEKIT_WORKSPACE_ROOT=/usr/src/debug/dev.peios.prelude/.workspace --remap-path-prefix=$PEKIT_OUT_BASE=/usr/src/debug/dev.peios.prelude/.build --remap-path-prefix=$SRC=/usr/src/debug/dev.peios.prelude"
+REMAP_RUSTFLAGS="--remap-path-prefix=$PEKIT_WORKSPACE_ROOT=/usr/src/debug/dev.peios.prelude/.workspace --remap-path-prefix=$PEKIT_OUT_BASE=/usr/src/debug/dev.peios.prelude/.build --remap-path-prefix=$SRC=/usr/src/debug/dev.peios.prelude"
+MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C link-arg=--build-id=sha1 $REMAP_RUSTFLAGS"
+export RUSTFLAGS=$MUSL_RUSTFLAGS
 
-# Test the exact graph and prove independent target directories are identical
-# before stripping either copy.
-cargo test --release --workspace --locked --offline \
-  --target "$TARGET" --target-dir "$PEKIT_OUT/test-target"
+# Peios ships this target as a package. Debian does not ship a precompiled
+# musl std target, so its reference rung builds the exact distro rust-src with
+# Cargo's build-std facility instead of downloading a rustup component.
+CARGO_BUILD_STD=
+target_libdir=$(rustc --print target-libdir --target "$TARGET")
+if ! find "$target_libdir" -maxdepth 1 -type f -name 'libstd-*.rlib' -print -quit 2>/dev/null | grep -q .; then
+  test -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library"
+  export RUSTC_BOOTSTRAP=1
+  # Debian ships musl-gcc but not rust-lld.  Its compiler-driver interface
+  # needs the equivalent linker options wrapped in -Wl, form.  Prelude's
+  # release profile is panic=abort, so build std with immediate abort and no
+  # backtrace paths. Debian's LLVM unwind archive is otherwise portable but
+  # was compiled with two glibc fortify entry points; append tiny musl-built
+  # ABI wrappers for those calls in this reference environment only.
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+  UNWIND_DIR="$PEKIT_OUT/musl-unwind"
+  mkdir -p "$UNWIND_DIR"
+  cp /usr/lib/llvm-19/lib/libunwind.a "$UNWIND_DIR/libunwind.a"
+  musl-gcc -std=c11 -Wall -Wextra -Werror -O2 -c \
+    "$SRC/packaging/debian-musl-fortify-shim.c" -o "$UNWIND_DIR/fortify-shim.o"
+  ar r "$UNWIND_DIR/libunwind.a" "$UNWIND_DIR/fortify-shim.o"
+  MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=no -L native=$UNWIND_DIR -C link-arg=-Wl,-z,relro -C link-arg=-Wl,-z,now -C link-arg=-Wl,--build-id=sha1 $REMAP_RUSTFLAGS"
+  export RUSTFLAGS=$MUSL_RUSTFLAGS
+  CARGO_BUILD_STD='-Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort'
+fi
+
+# Run the complete test suite with the distribution's native precompiled std.
+# Debian's stable Cargo build-std path cannot build a cross-target libtest for a
+# panic=abort workspace without creating two incompatible core instances.  The
+# shipped musl graph is exercised independently below by two clean release
+# builds and by the package-level static-PIE smoke checks.
+cargo clean --target-dir "$PEKIT_OUT/test-target"
+RUSTFLAGS="$REMAP_RUSTFLAGS" \
+  cargo test --release --workspace --locked --offline \
+  --target x86_64-unknown-linux-gnu --target-dir "$PEKIT_OUT/test-target"
+export RUSTFLAGS=$MUSL_RUSTFLAGS
 for tree in build-a build-b; do
-  cargo build --release --workspace --locked --offline \
+  cargo clean --target-dir "$PEKIT_OUT/$tree"
+  cargo $CARGO_BUILD_STD build --release --workspace --locked --offline \
     --target "$TARGET" --target-dir "$PEKIT_OUT/$tree"
 done
 for bin in prelude seed-sd; do
@@ -69,13 +104,16 @@ cp "$SRC/src/hook-log.sh" "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
 chmod 0755 "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"
 chmod 0644 "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
 
-# Prelude itself is MIT. For OR-licensed Rust dependencies the binary elects
-# Apache-2.0; unicode-ident additionally requires Unicode-3.0.
+# Prelude itself and the ordinary OR-licensed dependencies elect MIT;
+# unicode-ident additionally requires Unicode-3.0, while Rust's
+# compiler-builtins carries Apache-2.0 with LLVM-exception alongside MIT.
 cp "$SRC/LICENSE" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/LICENSE"
-cp "$SRC/vendor/proc-macro2/LICENSE-APACHE" \
+cp "$SRC/vendor/proc-macro2-1.0.106/LICENSE-APACHE" \
    "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Apache-2.0.txt"
-cp "$SRC/vendor/unicode-ident/LICENSE-UNICODE" \
+cp "$SRC/vendor/unicode-ident-1.0.24/LICENSE-UNICODE" \
    "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt"
+cp "$SRC/vendor/compiler_builtins-0.1.140/LICENSE.txt" \
+   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/compiler-builtins.txt"
 
 split_debug() {
   elf=$1
@@ -170,6 +208,8 @@ test "$actual" = '[  OK  ] fixture: mounted'
 "org.rust-lang.rust" = ">= 1.98.1"
 "org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
 "org.gnu.binutils" = "*"
+"org.gnu.findutils" = "*"
+"org.gnu.grep" = "*"
 "org.sourceware.debugedit" = "*"
 "org.python.python3" = "*"
 
@@ -179,16 +219,23 @@ dash = "*"
 cargo = "*"
 rustc = "*"
 binutils = "*"
+findutils = "*"
+grep = "*"
 debugedit = "*"
 python3 = "*"
 musl-tools = "*"
+rust-src = "*"
+libunwind-19-dev = "*"
 
 [test]
 command = '''
 set -eu
 export CARGO_HOME="$PEKIT_OUT/cargo-home"
 mkdir -p "$CARGO_HOME"
-cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl
+TARGET=x86_64-unknown-linux-musl
+cargo clean --target-dir "$PEKIT_OUT/target"
+cargo test --workspace --locked --offline \
+  --target x86_64-unknown-linux-gnu --target-dir "$PEKIT_OUT/target"
 /usr/bin/sh -n src/hook-log.sh
 '''
 
@@ -196,12 +243,17 @@ cargo test --workspace --locked --offline --target x86_64-unknown-linux-musl
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
 "org.rust-lang.rust-std-x86_64-unknown-linux-musl" = ">= 1.98.1"
+"org.gnu.findutils" = "*"
+"org.gnu.grep" = "*"
 
 [test.dependencies.apt]
 dash = "*"
 cargo = "*"
 rustc = "*"
 musl-tools = "*"
+rust-src = "*"
+findutils = "*"
+grep = "*"
 
 [clean]
 command = "cargo clean"
