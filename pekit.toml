@@ -80,10 +80,6 @@ fi
 # panic=abort workspace without creating two incompatible core instances.  The
 # shipped musl graph is exercised independently below by two clean release
 # builds and by the package-level static-PIE smoke checks.
-cargo clean --target-dir "$PEKIT_OUT/test-target"
-RUSTFLAGS="$REMAP_RUSTFLAGS" \
-  cargo test --release --workspace --locked --offline \
-  --target x86_64-unknown-linux-gnu --target-dir "$PEKIT_OUT/test-target"
 export RUSTFLAGS=$MUSL_RUSTFLAGS
 for tree in build-a build-b; do
   cargo clean --target-dir "$PEKIT_OUT/$tree"
@@ -170,6 +166,50 @@ while IFS= read -r origin; do
 done
 test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 
+'''
+
+[build.main.dependencies.peipkg]
+"dev.peios.build-essentials" = "*"
+"org.git.kernel.dash" = "*"
+"org.rust-lang.rust" = ">= 1.98.1"
+"org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
+"org.llvm.lld" = ">= 22, < 23"
+"org.gnu.binutils" = "*"
+"org.gnu.findutils" = "*"
+"org.gnu.grep" = "*"
+"org.sourceware.debugedit" = "*"
+"org.python.python3" = "*"
+
+[build.main.dependencies.apt]
+build-essential = "*"
+dash = "*"
+cargo = "*"
+rustc = "*"
+binutils = "*"
+findutils = "*"
+grep = "*"
+debugedit = "*"
+python3 = "*"
+musl-tools = "*"
+rust-src = "*"
+libunwind-19-dev = "*"
+
+[test]
+gate = true
+needs = ["main"]
+command = '''
+set -eu
+export CARGO_HOME="$PEKIT_OUT/cargo-home"
+mkdir -p "$CARGO_HOME"
+TARGET=x86_64-unknown-linux-musl
+cargo clean --target-dir "$PEKIT_OUT/test-target"
+cargo test --release --workspace --locked --offline \
+  --target x86_64-unknown-linux-gnu --target-dir "$PEKIT_OUT/test-target"
+/usr/bin/sh -n src/hook-log.sh
+
+# Validate the exact staged package output produced by build.main.
+SRC=$(pwd -P)
+PEKIT_OUT="$PEKIT_MAIN_OUT"
 # Fail closed on static PIE, hardening, split-debug linkage, and path leakage.
 for elf in "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"; do
   readelf -h "$elf" | grep -Eq 'Type:[[:space:]]+DYN'
@@ -202,7 +242,7 @@ actual=$(
 test "$actual" = '[  OK  ] fixture: mounted'
 '''
 
-[build.main.dependencies.peipkg]
+[test.dependencies.peipkg]
 "dev.peios.build-essentials" = "*"
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
@@ -214,7 +254,7 @@ test "$actual" = '[  OK  ] fixture: mounted'
 "org.sourceware.debugedit" = "*"
 "org.python.python3" = "*"
 
-[build.main.dependencies.apt]
+[test.dependencies.apt]
 build-essential = "*"
 dash = "*"
 cargo = "*"
@@ -227,34 +267,6 @@ python3 = "*"
 musl-tools = "*"
 rust-src = "*"
 libunwind-19-dev = "*"
-
-[test]
-command = '''
-set -eu
-export CARGO_HOME="$PEKIT_OUT/cargo-home"
-mkdir -p "$CARGO_HOME"
-TARGET=x86_64-unknown-linux-musl
-cargo clean --target-dir "$PEKIT_OUT/target"
-cargo test --workspace --locked --offline \
-  --target x86_64-unknown-linux-gnu --target-dir "$PEKIT_OUT/target"
-/usr/bin/sh -n src/hook-log.sh
-'''
-
-[test.dependencies.peipkg]
-"org.git.kernel.dash" = "*"
-"org.rust-lang.rust" = ">= 1.98.1"
-"org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
-"org.gnu.findutils" = "*"
-"org.gnu.grep" = "*"
-
-[test.dependencies.apt]
-dash = "*"
-cargo = "*"
-rustc = "*"
-musl-tools = "*"
-rust-src = "*"
-findutils = "*"
-grep = "*"
 
 [clean]
 command = "cargo clean"
