@@ -2,7 +2,7 @@
 format = "peipkg"
 
 [package]
-version       = "{{version}}-1"
+version       = "{{version}}-9"
 architecture  = "x86_64"
 license       = "MIT AND Apache-2.0 WITH LLVM-exception AND Unicode-3.0"
 license_class = "free"
