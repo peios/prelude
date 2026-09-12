@@ -623,9 +623,14 @@ fn read_hook_seq() -> std::io::Result<Vec<SeqHook>> {
     // the image was built by an mkirf that knows more than we do — but say
     // so, because the boot is not running the manifest the image considers
     // authoritative.
+    // log_warn, not log: this carries the `[ WARN ]` tag every other prelude
+    // warning carries, and survives the `peios.quiet=2` blackout. Production
+    // images boot quiet, and a blackout is a preference about noise rather than
+    // an instruction to hide the fact that the boot is not running the manifest
+    // the image considers authoritative.
     if let Some((newest, newest_path)) = choice.newer {
-        log(&format!(
-            "warning: {newest_path} is version {newest}, newer than this prelude \
+        log_warn(&format!(
+            "{newest_path} is version {newest}, newer than this prelude \
              supports (max {HOOK_SEQ_MAX}); using {path}"
         ));
     }
