@@ -209,11 +209,15 @@ fn do_mount(
 fn seed_dev() {
     match spawn_and_wait(SEED_SD, &["-r", "/dev"]) {
         Ok(status) if (status >> 8) & 0xff == 0 => log_ok("seeded /dev"),
-        Ok(status) => log_err(&format!(
+        // log_warn, not log_err: the boot goes on to complete and hand off, and
+        // `[FAILED]` on a boot that succeeded is what teaches an operator to
+        // skip the tag. It still bypasses the peios.quiet=2 blackout, which is
+        // right — a degraded /dev is not noise.
+        Ok(status) => log_warn(&format!(
             "seed-sd -r /dev exited with status {}; /dev stays SYSTEM-only for nodes it could not stamp",
             (status >> 8) & 0xff
         )),
-        Err(e) => log_err(&format!("seed /dev: {e}; /dev stays SYSTEM-only")),
+        Err(e) => log_warn(&format!("seed /dev: {e}; /dev stays SYSTEM-only")),
     }
 }
 
@@ -1015,27 +1019,28 @@ fn boot() -> std::io::Result<()> {
     // shared-mount propagation. Modern kernels default new mounts to shared
     // namespace propagation, which makes MS_MOVE return EACCES on mounts
     // marked shared.
-    do_mount("none", "/", None, MS_REC | MS_PRIVATE, None)?;
+    do_mount("none", "/", None, MS_REC | MS_PRIVATE, None)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("mount --make-rprivate /: {e}")))?;
 
     // Phase 1: kernel virtual filesystems.
+    //
+    // Each failure names its target, as phase 5's mount-moves do. This is the
+    // earliest failure prelude can have — no hook has run, so there is no name
+    // to blame and no partial progress to read — and an operator who is handed
+    // only an errno has nothing at all to go on.
     try_mkdir("/proc");
     try_mkdir("/sys");
     try_mkdir("/dev");
-    do_mount(
-        "proc",
-        "/proc",
-        Some("proc"),
-        MS_NOSUID | MS_NOEXEC | MS_NODEV,
-        None,
-    )?;
-    do_mount(
-        "sysfs",
-        "/sys",
-        Some("sysfs"),
-        MS_NOSUID | MS_NOEXEC | MS_NODEV,
-        None,
-    )?;
-    do_mount("devtmpfs", "/dev", Some("devtmpfs"), MS_NOSUID, None)?;
+    for (source, target, fstype, flags) in [
+        ("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV),
+        ("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV),
+        // devtmpfs is the exception: device nodes are the point of it, so
+        // MS_NODEV is impossible and MS_NOEXEC is not asked for either.
+        ("devtmpfs", "/dev", "devtmpfs", MS_NOSUID),
+    ] {
+        do_mount(source, target, Some(fstype), flags, None)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("mount {target}: {e}")))?;
+    }
     seed_dev();
 
     // The cmdline becomes readable here and not before — main runs ahead of any
