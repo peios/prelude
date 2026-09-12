@@ -847,7 +847,20 @@ fn rescue_shell(reason: &str) {
         ));
         return;
     }
-    log("rescue shell exited");
+    // Only say a shell exited if there was one.
+    //
+    // On a failed execve the child reports `rescue: exec … failed` itself and
+    // leaves with 127 — the status that means "could not exec" throughout
+    // prelude, the same one a hook produces when its file is not executable.
+    // Following that line with "rescue shell exited" reads as though the
+    // operator had been given a shell and walked out of it.
+    if status & 0x7f == 0 && (status >> 8) & 0xff == 127 {
+        log("rescue: no shell was started");
+    } else if let Some(reason) = wait_failure(status) {
+        log(&format!("rescue shell {reason}"));
+    } else {
+        log("rescue shell exited");
+    }
 }
 
 // Run every hook the sequence lists, in order. Called before the
@@ -855,10 +868,24 @@ fn rescue_shell(reason: &str) {
 // `breaks` may pause before the first hook (bare rd.break) or before a named
 // one (rd.break=<hook>), dropping to a shell that resumes on exit.
 fn run_hooks(breaks: &Breakpoints) -> std::io::Result<()> {
-    let hooks = read_hook_seq()?;
+    // The bare breakpoint comes FIRST, before the sequence is even read.
+    //
+    // It means "the kernel virtual filesystems are up and nothing
+    // deployment-specific has happened yet", and reading the manifest is not
+    // deployment-specific work. Reading first would mean that a sequence which
+    // is missing, malformed, from the future or carrying a bad marker never
+    // reaches the breakpoint at all — the operator would get the FAILURE shell
+    // instead, which halts on exit where a breakpoint resumes, and the one
+    // thing they could not repair-and-continue would be a broken manifest:
+    // a few lines of text at a known path, rewritable by hand from this very
+    // shell. Stopping here makes such an edit take effect on resume.
+    //
+    // Named breakpoints stay where they are, inside the scheduler: they match
+    // against hook paths, which do not exist until the sequence is parsed.
     if breaks.before_any {
         rescue_shell("rd.break: stopping before any hooks (exit to continue)");
     }
+    let hooks = read_hook_seq()?;
     if hooks.is_empty() {
         log("no hooks to run");
         return Ok(());
