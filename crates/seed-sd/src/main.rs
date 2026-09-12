@@ -58,7 +58,7 @@
 // default must stay narrow, and the widening happens at the call site that
 // wants it.
 //
-// Usage: seed-sd [-r|--recursive] [--sddl <descriptor>] <path>
+// Usage: seed-sd [-r|--recursive] [--sddl <descriptor>] [--] <path>
 //
 // Exits 0 on success, 2 on usage error, 1 if any node could not be seeded.
 
@@ -68,10 +68,22 @@ fn main() -> ExitCode {
     let mut recursive = false;
     let mut sddl: Option<String> = None;
     let mut path: Option<String> = None;
+    // Everything after a `--` is a path, however it is spelled. Without it
+    // there would be no way to name a file that genuinely begins with a dash,
+    // since an unrecognised one is now refused.
+    let mut end_of_flags = false;
     let mut args = std::env::args();
     let prog = args.next().unwrap_or_else(|| "seed-sd".into());
     while let Some(arg) = args.next() {
+        if end_of_flags {
+            if path.is_some() {
+                return usage(&prog, &format!("more than one path, at {arg:?}"));
+            }
+            path = Some(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => end_of_flags = true,
             "-r" | "--recursive" => recursive = true,
             // A missing value is a usage error rather than an empty
             // descriptor: silently seeding the built-in default when the
@@ -79,14 +91,30 @@ fn main() -> ExitCode {
             // exists to make impossible.
             "--sddl" => match args.next() {
                 Some(value) => sddl = Some(value),
-                None => return usage(&prog),
+                None => return usage(&prog, "--sddl needs a descriptor after it"),
             },
+            // An unrecognised flag is a mistake, not a filename.
+            //
+            // Taking it as the path instead turned `seed-sd --recursiv /mnt`
+            // into an ENOENT about a file named after the flag, while /mnt was
+            // never touched — and an unseeded tree is MISSING descriptors,
+            // which under KACS denies everything to everyone, somewhere else,
+            // later. That is the failure the --sddl arm above already refuses
+            // to risk; the same reasoning applies here.
+            _ if arg.starts_with('-') => {
+                return usage(
+                    &prog,
+                    &format!(
+                        "unknown flag {arg:?} (put -- before a path that begins with a dash)"
+                    ),
+                )
+            }
             _ if path.is_none() => path = Some(arg),
-            _ => return usage(&prog),
+            _ => return usage(&prog, &format!("more than one path, at {arg:?}")),
         }
     }
     let Some(path) = path else {
-        return usage(&prog);
+        return usage(&prog, "no path given");
     };
 
     let sd = match build_sd(sddl.as_deref()) {
@@ -116,8 +144,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn usage(prog: &str) -> ExitCode {
-    eprintln!("usage: {prog} [-r|--recursive] [--sddl <descriptor>] <path>");
+/// Refuse the command line, saying which of the four mistakes it was.
+///
+/// The usage line alone cannot: "no path", "two paths", "--sddl with nothing
+/// after it" and "unknown flag" all look identical in it, and the reader of a
+/// boot log is being asked to spot the difference between what they typed and
+/// a grammar. One string apiece is cheap.
+fn usage(prog: &str, problem: &str) -> ExitCode {
+    eprintln!("seed-sd: {problem}");
+    eprintln!("usage: {prog} [-r|--recursive] [--sddl <descriptor>] [--] <path>");
     ExitCode::from(2)
 }
 
@@ -131,10 +166,36 @@ fn usage(prog: &str) -> ExitCode {
 fn build_sd(sddl: Option<&str>) -> Result<Vec<u8>, String> {
     match sddl {
         Some(text) => libp_sd::sddl::parse(text)
-            .map_err(|e| format!("parse {text:?}: {e:?}"))?
+            .map_err(|e| format!("parse {text:?}: {}", sddl_problem(&e)))?
             .build()
-            .map_err(|e| format!("build {text:?}: {e:?}")),
+            .map_err(|e| format!("build {text:?}: {}", render(e))),
         None => build_seed_sd(),
+    }
+}
+
+/// A libp-sd error as a person reads it rather than as Rust prints it.
+///
+/// `{:?}` on the library's error type gives `Syscall(Errno(95))` — a numeric
+/// errno inside two layers of Rust type name — where the operator wanted
+/// "Operation not supported". The `From<Error> for std::io::Error` conversion
+/// maps a syscall error onto the platform's own strerror text and leaves every
+/// other variant as its `Display`, which is exactly the split wanted here.
+fn render(e: libp_sd::Error) -> String {
+    std::io::Error::from(e).to_string()
+}
+
+/// The SDDL parser's verdict, with the one misleading variant translated.
+///
+/// `Empty` is what the parser returns for input carrying no `O:`, `G:`, `D:`
+/// or `S:` section — so `--sddl 'not a descriptor'` reports "empty SDDL
+/// input", which reads as a complaint that the string was empty when the
+/// operator can see that it was not.
+fn sddl_problem(e: &libp_sd::sddl::SddlError) -> String {
+    match e {
+        libp_sd::sddl::SddlError::Empty => {
+            "no O:, G:, D: or S: section — this is not a security descriptor".to_string()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -214,8 +275,8 @@ fn build_seed_sd() -> Result<Vec<u8>, String> {
     //
     // Spelled as a literal SID because `WellKnownSid` has no CREATOR OWNER
     // variant and neither SDDL vocabulary has a `CO` alias.
-    let creator_owner_sid =
-        libp_sd::sddl::parse_sid("S-1-3-0").map_err(|e| format!("CREATOR OWNER sid: {e:?}"))?;
+    let creator_owner_sid = libp_sd::sddl::parse_sid("S-1-3-0")
+        .map_err(|e| format!("CREATOR OWNER sid: {}", sddl_problem(&e)))?;
     let creator_owner = libp_sd::AceBuilder::allow(creator_owner_sid, ACCESS_GENERIC_ALL)
         .flags(inheritable | ACE_FLAG_INHERIT_ONLY);
     let dacl = libp_sd::AclBuilder::new()
@@ -227,7 +288,7 @@ fn build_seed_sd() -> Result<Vec<u8>, String> {
         .group(libp_sd::WellKnownSid::LocalSystem)
         .dacl(dacl)
         .build()
-        .map_err(|e| format!("{e:?}"))
+        .map_err(render)
 }
 
 /// Stamp the seed SD (owner + group + dacl) onto one path. A symlink is
@@ -239,7 +300,7 @@ fn seed_one(path: &str, sd: &[u8]) -> Result<(), String> {
         path,
         no_follow_symlinks: true,
     };
-    libp_sd::set_sd(&target, info, sd).map_err(|e| format!("set_sd {path}: {e:?}"))
+    libp_sd::set_sd(&target, info, sd).map_err(|e| format!("set_sd {path}: {}", render(e)))
 }
 
 /// Seed `path`, then descend into it if it is a directory. `path` is seeded
