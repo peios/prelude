@@ -394,16 +394,29 @@ fn log_err(msg: &str) {
 }
 
 // Returns the init= value from /proc/cmdline if present.
+//
+// The LAST occurrence wins, as it does for every repeated kernel parameter and
+// for the two other knobs prelude reads (`peios.quiet=` and `TERM=`). Appending
+// is how a boot parameter is overridden — by a bootloader entry, a UKI addon, a
+// test harness, or an operator typing at the boot prompt — so an appended
+// `init=/bin/sh` on a line that already names one has to be the one that counts.
+//
+// An empty value is filtered out before the last is taken, so `init=` on its own
+// remains no value at all: `init=/bin/sh init=` uses /bin/sh.
 fn cmdline_init() -> Option<String> {
     let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
-    for tok in cmdline.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("init=") {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    cmdline_init_from(&cmdline)
+}
+
+// The parser proper, taking the command line as an argument so it is testable
+// without /proc.
+fn cmdline_init_from(cmdline: &str) -> Option<String> {
+    cmdline
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix("init="))
+        .filter(|v| !v.is_empty())
+        .next_back()
+        .map(str::to_string)
 }
 
 // Whether `flag` appears on the cmdline as a bare token (e.g. rd.shell).
@@ -1182,8 +1195,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmdline_has, parse_hook_seq_v2, schedule_hooks, select_hook_seq, wait_failure, Breakpoints,
-        Outcome, SeqHook, FALLBACK_INITS, RESCUE_SHELL,
+        cmdline_has, cmdline_init_from, parse_hook_seq_v2, schedule_hooks, select_hook_seq,
+        wait_failure, Breakpoints, Outcome, SeqHook, FALLBACK_INITS, RESCUE_SHELL,
     };
     use std::cell::RefCell;
 
@@ -1553,6 +1566,39 @@ mod tests {
         assert!(!cmdline_has("console=ttyS0 panic=-1", "rd.shell"));
         // a value form is not a bare flag
         assert!(!cmdline_has("rd.shell=1", "rd.shell"));
+    }
+
+    #[test]
+    fn the_last_init_on_the_cmdline_wins() {
+        // The kernel's own rule for a repeated parameter, and the rule
+        // `init_quiet` and `init_colour` already follow — so appending an
+        // override to an existing line works, which is how a recovery boot is
+        // asked for.
+        assert_eq!(
+            cmdline_init_from("init=/bin/peinit2 ro init=/bin/sh").as_deref(),
+            Some("/bin/sh")
+        );
+        assert_eq!(
+            cmdline_init_from("console=ttyS0 init=/bin/peinit2").as_deref(),
+            Some("/bin/peinit2")
+        );
+        assert_eq!(cmdline_init_from("console=ttyS0 ro"), None);
+    }
+
+    #[test]
+    fn an_empty_init_value_is_no_value_at_all() {
+        // Filtered before the last is taken, so a trailing `init=` does not
+        // erase a real one earlier on the line — it is simply not a value.
+        assert_eq!(cmdline_init_from("init="), None);
+        assert_eq!(cmdline_init_from("init= init="), None);
+        assert_eq!(
+            cmdline_init_from("init=/bin/sh init=").as_deref(),
+            Some("/bin/sh")
+        );
+        assert_eq!(
+            cmdline_init_from("init= init=/bin/sh").as_deref(),
+            Some("/bin/sh")
+        );
     }
 
     #[test]
