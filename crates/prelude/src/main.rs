@@ -725,7 +725,45 @@ fn parse_hook_seq_v2<'a>(
         };
         slot.extend(rest.split_whitespace().map(str::to_string));
     }
+    check_requires_are_supplied(path, &hooks)?;
     Ok(hooks)
+}
+
+// Every `requires` in the sequence must name something the sequence itself
+// supplies, by `provides` or by `contributes`.
+//
+// mkirf refuses such a manifest at build time, so no image built by the
+// shipped toolchain reaches this. But hooks.seq is a cross-package format —
+// mkirf is a peiosutils applet and prelude ships in its own package — and
+// prelude parses the file rather than trusting a build it did not run. Every
+// other structural problem here is caught at parse time and refuses the boot;
+// without this one, a hook requiring a capability nothing supplies is
+// vacuously ready (`cap_settled` is an `all()` over no suppliers, and
+// `cap_achieved` short-circuits on "nothing provides it") and runs on the
+// first pass with no diagnostic at all — which leaves the distinction between
+// `requires` and `after` meaning nothing.
+//
+// `after` is deliberately NOT checked. It means "if anything supplies this, be
+// ordered after it", so naming a milestone this image does not have is exactly
+// what it is for. The wording mirrors mkirf's own refusal, so the same mistake
+// reads the same whether it is caught at build time or at boot.
+fn check_requires_are_supplied(path: &str, hooks: &[SeqHook]) -> std::io::Result<()> {
+    let supplies = |cap: &str| {
+        hooks
+            .iter()
+            .any(|h| h.provides.iter().chain(&h.contributes).any(|c| c == cap))
+    };
+    for hook in hooks {
+        for cap in &hook.requires {
+            if !supplies(cap) {
+                return Err(std::io::Error::other(format!(
+                    "{path}: hook `{}` requires capability `{cap}`, which no hook provides",
+                    hook.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Fork-exec `path` with `args` and wait for it. The child gets the same
@@ -956,7 +994,11 @@ fn stuck_reason(hooks: &[SeqHook], state: &[Option<Outcome>]) -> String {
                     why.push(format!("`{cap}` — every provider declined it"));
                 }
             } else {
-                why.push(format!("`{cap}` — not achieved"));
+                // Not "not achieved": that is true of the settled-and-declined
+                // case above as well, so it does nothing to tell the two apart —
+                // and `after`, in this exact state, already says the precise
+                // thing. The two relationships describe one condition one way.
+                why.push(format!("`{cap}` — not settled (a supplier has not finished)"));
             }
         }
         for cap in &h.after {
@@ -1436,6 +1478,31 @@ mod tests {
     }
 
     #[test]
+    fn an_unsettled_capability_reads_the_same_to_requires_and_to_after() {
+        // One capability in one state, described once. `requires` used to call
+        // it "not achieved" — which is equally true of the settled-and-declined
+        // case and so distinguishes nothing — while `after`, in that same
+        // state, already said the precise thing.
+        let hooks = vec![
+            h("/hooks/needs.sh", &[], &[], &["cap"], &[]),
+            h("/hooks/after.sh", &[], &[], &[], &["cap"]),
+            h("/hooks/staller.sh", &["cap"], &[], &[], &[]),
+        ];
+        let (r, _) = drive(&hooks, &[("/hooks/staller.sh", &[Outcome::Deferred])]);
+        let err = r.unwrap_err().to_string();
+        for line in err.lines() {
+            if line.contains("/hooks/needs.sh") || line.contains("/hooks/after.sh") {
+                assert!(line.contains("`cap` — not settled"), "{err}");
+            }
+        }
+        assert!(
+            err.contains("not settled (a supplier has not finished)"),
+            "requires says why the wait is not over: {err}"
+        );
+        assert!(!err.contains("not achieved"), "{err}");
+    }
+
+    #[test]
     fn a_hook_that_only_ever_defers_is_a_named_failure_not_a_spin() {
         let hooks = vec![h("/hooks/waiting.sh", &[], &[], &[], &[])];
         let (r, calls) = drive(&hooks, &[("/hooks/waiting.sh", &[Outcome::Deferred])]);
@@ -1584,9 +1651,15 @@ mod tests {
 
     #[test]
     fn v2_takes_several_capabilities_on_one_line() {
-        let hooks =
-            parse_hook_seq_v2("t", "hook /hooks/a.sh\nrequires one two three\n".lines()).unwrap();
-        assert_eq!(hooks[0].requires, ["one", "two", "three"]);
+        // The suppliers are here because every `requires` must name something
+        // the sequence supplies; the assertion is about the split, not them.
+        let body = "hook /hooks/supply.sh\n\
+                    provides one two three\n\
+                    hook /hooks/a.sh\n\
+                    requires one two three\n";
+        let hooks = parse_hook_seq_v2("t", body.lines()).unwrap();
+        assert_eq!(hooks[0].provides, ["one", "two", "three"]);
+        assert_eq!(hooks[1].requires, ["one", "two", "three"]);
     }
 
     #[test]
@@ -1605,6 +1678,35 @@ mod tests {
     fn v2_rejects_an_unknown_key() {
         let err = parse_hook_seq_v2("t", "hook /hooks/a.sh\nprovydes x\n".lines()).unwrap_err();
         assert!(err.to_string().contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn v2_rejects_a_requires_nothing_in_the_sequence_supplies() {
+        // mkirf refuses this at build time, but hooks.seq is a cross-package
+        // format and prelude parses the file rather than trusting a build it
+        // did not run. Uncaught, the hook is vacuously ready and runs with no
+        // diagnostic at all.
+        let body = "hook /hooks/needy.sh\nrequires nobody-supplies-this\n";
+        let err = parse_hook_seq_v2("t", body.lines()).unwrap_err().to_string();
+        assert!(err.contains("/hooks/needy.sh"), "{err}");
+        assert!(err.contains("nobody-supplies-this"), "{err}");
+        assert!(err.contains("which no hook provides"), "{err}");
+    }
+
+    #[test]
+    fn v2_accepts_a_requires_supplied_either_way_and_any_after() {
+        // `provides` and `contributes` both count as supplying. `after` is
+        // never checked: "if anything supplies this, be ordered after it" is
+        // the whole point of it, so an unsupplied one must stay legal.
+        for supply in ["provides", "contributes"] {
+            let body = format!("hook /hooks/a.sh\n{supply} cap\nhook /hooks/b.sh\nrequires cap\n");
+            let hooks = parse_hook_seq_v2("t", body.lines())
+                .unwrap_or_else(|e| panic!("{supply} should supply `cap`: {e}"));
+            assert_eq!(paths(&hooks), ["/hooks/a.sh", "/hooks/b.sh"]);
+        }
+        let hooks =
+            parse_hook_seq_v2("t", "hook /hooks/late.sh\nafter never-supplied\n".lines()).unwrap();
+        assert_eq!(paths(&hooks), ["/hooks/late.sh"]);
     }
 
     #[test]
