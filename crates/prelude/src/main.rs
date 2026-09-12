@@ -51,8 +51,14 @@ extern "C" {
     fn sync();
     fn fork() -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
 }
+
+// waitpid: also return for a child that STOPPED rather than terminated.
+// Without it a stopped child is not a wait event at all and the caller blocks.
+const WUNTRACED: c_int = 2;
+const SIGKILL: c_int = 9;
 
 const RB_HALT_SYSTEM: c_int = 0xcdef0123u32 as c_int;
 // errno 39 — a directory that still holds entries. Expected when those entries
@@ -734,8 +740,20 @@ fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
         unsafe { _exit(127) };
     }
     let mut status: c_int = 0;
-    if unsafe { waitpid(pid, &mut status, 0) } < 0 {
+    // WUNTRACED, so a child that STOPS is a wait event rather than silence.
+    // Without it `waitpid` returns only on termination, and a hook that takes a
+    // job-control stop leaves prelude blocked with nothing in the initramfs
+    // able to resume it: no job control, no other process, no timeout.
+    if unsafe { waitpid(pid, &mut status, WUNTRACED) } < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    if status & 0x7f == 0x7f {
+        // The child is stopped, not gone. Nothing will ever send it SIGCONT, so
+        // kill it and reap it here rather than carry a stopped process — and a
+        // zombie after it — into the new root's namespace.
+        unsafe { kill(pid, SIGKILL) };
+        let mut reaped: c_int = 0;
+        unsafe { waitpid(pid, &mut reaped, 0) };
     }
     if status & 0x7f != 0 {
         let reason = wait_failure(status).unwrap_or_else(|| "terminated abnormally".to_string());
@@ -1585,6 +1603,15 @@ mod tests {
         // a termination signal lives in the low 7 bits.
         let reason = wait_failure(9).expect("a signal kill must be a failure");
         assert!(reason.contains("signal 9"), "{reason}");
+    }
+
+    #[test]
+    fn a_stopped_child_is_reported_and_not_read_as_an_exit() {
+        // A stop is 0x7f in the low seven bits with the stopping signal above
+        // it — the one status where the "exit code" field holds a signal
+        // number, so decoding it as an exit would report a status of 19.
+        let reason = wait_failure((19 << 8) | 0x7f).expect("a stopped child must be a failure");
+        assert_eq!(reason, "stopped");
     }
 }
 
