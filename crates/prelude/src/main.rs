@@ -21,6 +21,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use core::ffi::{c_int, c_ulong};
+use std::cell::Cell;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
@@ -1013,7 +1014,14 @@ fn schedule_hooks(
 // The real work. Returns only on failure — success exits via execve. A
 // breakpoint (rd.break) pauses mid-hooks but then resumes, so it does not
 // change that contract.
-fn boot() -> std::io::Result<()> {
+//
+// `shell_on_failure` is how the debug knobs reach the caller. It is set the
+// moment phase 1 reads the command line and is never unset, so a failure in
+// phases 5 to 7 — after `/proc` has been mount-moved into the new root and
+// `/proc/cmdline` no longer exists — is still answered by what the operator
+// actually asked for. Left `None` only when the boot failed before the read,
+// which is the one case the caller has to go and look for itself.
+fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
     // Phase 0: make the rootfs and all descendant mounts private so that
     // mount-move (phase 5) and the root pivot (phase 7) aren't blocked by
     // shared-mount propagation. Modern kernels default new mounts to shared
@@ -1055,6 +1063,11 @@ fn boot() -> std::io::Result<()> {
 
     // Debug breakpoints, from the same read.
     let breaks = Breakpoints::from_cmdline(&cmdline);
+    // And the answer to "open a shell if this boot fails?", banked now while
+    // the command line is still readable. Any rd.break implies rd.shell.
+    shell_on_failure.set(Some(
+        cmdline_has(&cmdline, "rd.shell") || breaks.any(),
+    ));
 
     // Phase 2: figure out the target init.
     let target_init = match cmdline_init() {
@@ -1188,14 +1201,37 @@ fn halt() -> ! {
 }
 
 fn main() {
-    if let Err(e) = boot() {
+    // rd.shell (or any rd.break) drops to a shell on failure instead of
+    // halting. boot() banks the answer as soon as phase 1 has mounted /proc and
+    // read the command line, because it is the last moment at which every
+    // failure can still be answered: phase 5 mount-moves /proc into the new
+    // root, so re-reading /proc/cmdline here would find nothing for a failure
+    // in the handoff — which is precisely the half-built state an operator sets
+    // rd.shell to look at.
+    let shell_on_failure: Cell<Option<bool>> = Cell::new(None);
+    if let Err(e) = boot(&shell_on_failure) {
         log_err(&format!("boot failed: {e}"));
-        // rd.shell (or any rd.break) drops to a shell on failure instead of
-        // halting. /proc is mounted by the time boot reaches a failure, so the
-        // cmdline is readable here — it was not at process start, before any
-        // mounts, which is why the read lives here and not in boot's caller.
-        let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        if cmdline_has(&cmdline, "rd.shell") || Breakpoints::from_cmdline(&cmdline).any() {
+        let wanted = match shell_on_failure.get() {
+            Some(wanted) => wanted,
+            // The boot failed before the command line was ever read — phase 0
+            // or phase 1, with no /proc yet. Try for it anyway, and say so if
+            // it is not there: a halt that could not read the knobs must not
+            // look identical to a halt with none set.
+            None => match fs::read_to_string("/proc/cmdline") {
+                Ok(cmdline) => {
+                    cmdline_has(&cmdline, "rd.shell")
+                        || Breakpoints::from_cmdline(&cmdline).any()
+                }
+                Err(err) => {
+                    log_warn(&format!(
+                        "/proc/cmdline unreadable ({err}); halting without \
+                         checking for rd.shell"
+                    ));
+                    false
+                }
+            },
+        };
+        if wanted {
             rescue_shell(&format!("rd.shell: boot failed: {e} (exit to halt)"));
         }
     }
