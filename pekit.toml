@@ -53,41 +53,18 @@ MUSL_RUSTFLAGS="-Zcf-protection=full -C target-feature=+crt-static -C link-arg=-
 export RUSTC_BOOTSTRAP=1
 export RUSTFLAGS=$MUSL_RUSTFLAGS
 
-# Peios ships this target as a package. Debian does not ship a precompiled
-# musl std target, so its reference rung builds the exact distro rust-src with
-# Cargo's build-std facility instead of downloading a rustup component.
-CARGO_BUILD_STD=
+# Peios ships the precompiled musl std target as a package.
 target_libdir=$(rustc --print target-libdir --target "$TARGET")
-if ! find "$target_libdir" -maxdepth 1 -type f -name 'libstd-*.rlib' -print -quit 2>/dev/null | grep -q .; then
-  test -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library"
-  export RUSTC_BOOTSTRAP=1
-  # Debian ships musl-gcc but not rust-lld.  Its compiler-driver interface
-  # needs the equivalent linker options wrapped in -Wl, form.  Prelude's
-  # release profile is panic=abort, so build std with immediate abort and no
-  # backtrace paths. Debian's LLVM unwind archive is otherwise portable but
-  # was compiled with two glibc fortify entry points; append tiny musl-built
-  # ABI wrappers for those calls in this reference environment only.
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-  UNWIND_DIR="$PEKIT_OUT/musl-unwind"
-  mkdir -p "$UNWIND_DIR"
-  cp /usr/lib/llvm-19/lib/libunwind.a "$UNWIND_DIR/libunwind.a"
-  musl-gcc -std=c11 -Wall -Wextra -Werror -O2 -c \
-    "$SRC/packaging/debian-musl-fortify-shim.c" -o "$UNWIND_DIR/fortify-shim.o"
-  ar r "$UNWIND_DIR/libunwind.a" "$UNWIND_DIR/fortify-shim.o"
-  MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=no -L native=$UNWIND_DIR -C link-arg=-Wl,-z,relro -C link-arg=-Wl,-z,now -C link-arg=-Wl,--build-id=sha1 $REMAP_RUSTFLAGS"
-  export RUSTFLAGS=$MUSL_RUSTFLAGS
-  CARGO_BUILD_STD='-Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort'
-fi
+find "$target_libdir" -maxdepth 1 -type f -name 'libstd-*.rlib' -print -quit | grep -q . || {
+  echo "prelude: the $TARGET std package is missing from the build root" >&2
+  exit 1
+}
 
-# Run the complete test suite with the distribution's native precompiled std.
-# Debian's stable Cargo build-std path cannot build a cross-target libtest for a
-# panic=abort workspace without creating two incompatible core instances.  The
-# shipped musl graph is exercised independently below by two clean release
-# builds and by the package-level static-PIE smoke checks.
-export RUSTFLAGS=$MUSL_RUSTFLAGS
+# The shipped musl graph is exercised by two clean release builds and by the
+# package-level static-PIE smoke checks.
 for tree in build-a build-b; do
   cargo clean --target-dir "$PEKIT_OUT/$tree"
-  cargo $CARGO_BUILD_STD build --release --workspace --locked --offline \
+  cargo build --release --workspace --locked --offline \
     --target "$TARGET" --target-dir "$PEKIT_OUT/$tree"
 done
 for bin in prelude seed-sd; do
