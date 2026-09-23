@@ -1,6 +1,6 @@
 [package]
 name         = "dev.peios.prelude-debugsource"
-architecture = "x86_64"
+architecture = "noarch"
 description  = "Peios initramfs runtime debug sources"
 
 [files]
