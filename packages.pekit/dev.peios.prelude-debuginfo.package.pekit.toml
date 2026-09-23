@@ -3,7 +3,7 @@ name        = "dev.peios.prelude-debuginfo"
 description = "Peios initramfs runtime debugging symbols"
 
 [dependencies]
-"dev.peios.prelude" = "{{version}}"
+"dev.peios.prelude" = "= {{release}}"
 
 [files]
 "@source:LICENSE" = "usr/share/licenses/dev.peios.prelude-debuginfo/LICENSE"

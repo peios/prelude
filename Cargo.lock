@@ -42,7 +42,7 @@ source = "git+https://github.com/peios/pkm?tag=uapi%2Frust%2Fv0.1.0#c60b028b6a80
 
 [[package]]
 name = "prelude"
-version = "0.0.3"
+version = "0.0.5"
 
 [[package]]
 name = "proc-macro2"
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "seed-sd"
-version = "0.0.3"
+version = "0.0.5"
 dependencies = [
  "libp-sd",
 ]

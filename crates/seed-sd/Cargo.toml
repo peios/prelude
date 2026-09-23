@@ -1,6 +1,6 @@
 [package]
 name        = "seed-sd"
-version     = "0.0.3"
+version     = "0.0.5"
 description = "Initramfs helper: seed a default Allow-SYSTEM-GenericAll SD on a path via kacs_set_sd. Used by prelude hooks immediately after mounting a fresh tmpfs to dodge KACS DENY_MISSING."
 edition     = "2021"
 license     = "MIT"
