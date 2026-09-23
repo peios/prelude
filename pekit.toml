@@ -73,39 +73,31 @@ for bin in prelude seed-sd; do
 done
 
 mkdir -p "$PEKIT_OUT/usr/sbin" "$PEKIT_OUT/usr/bin" \
-             "$PEKIT_OUT/usr/libexec/prelude" \
-             "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude"
+             "$PEKIT_OUT/usr/libexec/prelude"
 cp "$PEKIT_OUT/build-a/$TARGET/release/prelude" "$PEKIT_OUT/usr/sbin/prelude"
 cp "$PEKIT_OUT/build-a/$TARGET/release/seed-sd" "$PEKIT_OUT/usr/bin/seed-sd"
 cp "$SRC/src/hook-log.sh" "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
 chmod 0755 "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"
 chmod 0644 "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
 
-# Prelude itself and the ordinary OR-licensed dependencies elect MIT;
-# unicode-ident additionally requires Unicode-3.0, while Rust's
-# compiler-builtins carries Apache-2.0 with LLVM-exception alongside MIT.
-cp "$SRC/LICENSE" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/LICENSE"
-# Vendored directories carry the crate version. Find each notice by crate
-# name so a vendor refresh cannot strand the copy, and fail if it is gone.
-vendored_licence() {
-  crate=$1
-  file=$2
-  dest=$3
-  found=
-  for candidate in "$SRC"/vendor/"$crate"-[0-9]*/"$file"; do
-    if test -f "$candidate"; then
-      found=$candidate
-    fi
-  done
-  test -n "$found" || {
-    echo "prelude: no vendored $crate provides $file" >&2
-    exit 1
-  }
-  cp "$found" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/$dest"
-}
-vendored_licence proc-macro2 LICENSE-APACHE Apache-2.0.txt
-vendored_licence unicode-ident LICENSE-UNICODE Unicode-3.0.txt
-vendored_licence compiler_builtins LICENSE.txt compiler-builtins.txt
+# Ship the notices of every crate prelude and seed-sd link and hold each
+# package definition to the conjunction of their licences (PEI-1163). The
+# libp-rs and peios-uapi crates carry no package-local notice; ship the
+# reviewed notices of those same pinned sources.
+LICENSE_ROOT=$PEKIT_OUT/licenses
+for definition in dev.peios.prelude dev.peios.prelude-debuginfo dev.peios.prelude-debugsource; do
+  /usr/libexec/peios-packaging/collect-rust-licences \
+    --licence-root "$LICENSE_ROOT" --root prelude --root seed-sd --target "$TARGET" \
+    --notice "git+https://github.com/peios/libp-rs.git=third-party/libp-rs-LICENSE" \
+    --notice "git+https://github.com/peios/pkm?=third-party/peios-uapi-LICENSE" \
+    --check "packages.pekit/$definition.package.pekit.toml"
+done
+test -s "$LICENSE_ROOT/crate-licenses.tsv"
+
+# The debug split stays local rather than using
+# /usr/libexec/peios-packaging/split-debug: RUSTFLAGS above already remap
+# DWARF away from the build root split-debug copies sources from, and
+# debugsource ships exactly the sources Cargo's depfiles name instead.
 
 split_debug() {
   elf=$1
@@ -175,6 +167,7 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.gnu.grep" = "*"
 "org.sourceware.debugedit" = "*"
 "org.python.python3" = "*"
+"dev.peios.packaging-tools" = "*"
 
 [test]
 gate = true

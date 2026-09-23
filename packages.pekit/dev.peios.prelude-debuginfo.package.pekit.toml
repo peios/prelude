@@ -1,13 +1,13 @@
 [package]
 name        = "dev.peios.prelude-debuginfo"
 description = "Peios initramfs runtime debugging symbols"
+# The same crate closure as prelude; checked by build.main.
+license     = "((MIT OR Apache-2.0) AND Unicode-3.0) AND (Apache-2.0 OR MIT) AND MIT"
 
 [dependencies]
 "dev.peios.prelude" = "= {{release}}"
 
 [files]
 "@source:LICENSE" = "usr/share/licenses/dev.peios.prelude-debuginfo/LICENSE"
-":usr/share/licenses/dev.peios.prelude/Apache-2.0.txt" = "usr/share/licenses/dev.peios.prelude-debuginfo/Apache-2.0.txt"
-":usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt" = "usr/share/licenses/dev.peios.prelude-debuginfo/Unicode-3.0.txt"
-":usr/share/licenses/dev.peios.prelude/compiler-builtins.txt" = "usr/share/licenses/dev.peios.prelude-debuginfo/compiler-builtins.txt"
+":licenses/**" = "usr/share/licenses/dev.peios.prelude-debuginfo/third-party"
 ":debug/usr/lib/debug/**" = "usr/lib/debug"
