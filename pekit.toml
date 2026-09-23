@@ -85,12 +85,27 @@ chmod 0644 "$PEKIT_OUT/usr/libexec/prelude/hook-log.sh"
 # unicode-ident additionally requires Unicode-3.0, while Rust's
 # compiler-builtins carries Apache-2.0 with LLVM-exception alongside MIT.
 cp "$SRC/LICENSE" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/LICENSE"
-cp "$SRC/vendor/proc-macro2-1.0.106/LICENSE-APACHE" \
-   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Apache-2.0.txt"
-cp "$SRC/vendor/unicode-ident-1.0.24/LICENSE-UNICODE" \
-   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt"
-cp "$SRC/vendor/compiler_builtins-0.1.140/LICENSE.txt" \
-   "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/compiler-builtins.txt"
+# Vendored directories carry the crate version. Find each notice by crate
+# name so a vendor refresh cannot strand the copy, and fail if it is gone.
+vendored_licence() {
+  crate=$1
+  file=$2
+  dest=$3
+  found=
+  for candidate in "$SRC"/vendor/"$crate"-[0-9]*/"$file"; do
+    if test -f "$candidate"; then
+      found=$candidate
+    fi
+  done
+  test -n "$found" || {
+    echo "prelude: no vendored $crate provides $file" >&2
+    exit 1
+  }
+  cp "$found" "$PEKIT_OUT/usr/share/licenses/dev.peios.prelude/$dest"
+}
+vendored_licence proc-macro2 LICENSE-APACHE Apache-2.0.txt
+vendored_licence unicode-ident LICENSE-UNICODE Unicode-3.0.txt
+vendored_licence compiler_builtins LICENSE.txt compiler-builtins.txt
 
 split_debug() {
   elf=$1
@@ -154,7 +169,7 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
 "org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
-"org.llvm.lld" = ">= 22, < 23"
+"org.llvm.lld" = ">= 22"
 "org.gnu.binutils" = "*"
 "org.gnu.findutils" = "*"
 "org.gnu.grep" = "*"
@@ -182,11 +197,20 @@ for elf in "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"; do
   readelf -h "$elf" | grep -Eq 'Type:[[:space:]]+DYN'
   readelf -lW "$elf" | grep -q 'GNU_RELRO'
   readelf -lW "$elf" | grep -Eq 'GNU_STACK[[:space:]].*RW[[:space:]]'
-  ! readelf -lW "$elf" | grep -q ' INTERP '
+  if readelf -lW "$elf" | grep ' INTERP ' >/dev/null; then
+    echo "prelude: $elf requests a program interpreter; it must be a static PIE" >&2
+    exit 1
+  fi
   readelf -dW "$elf" | grep -q 'BIND_NOW'
   readelf -dW "$elf" | grep -Eq 'FLAGS_1.*PIE'
-  ! readelf -dW "$elf" | grep -Eq '(NEEDED|RPATH|RUNPATH)'
-  ! readelf -SW "$elf" | grep -q '\.debug_info'
+  if readelf -dW "$elf" | grep -E '(NEEDED|RPATH|RUNPATH)' >/dev/null; then
+    echo "prelude: $elf needs a shared library or carries an RPATH/RUNPATH" >&2
+    exit 1
+  fi
+  if readelf -SW "$elf" | grep '\.debug_info' >/dev/null; then
+    echo "prelude: $elf still contains unsplit debug information" >&2
+    exit 1
+  fi
 
   build_id=$(readelf -n "$elf" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)
   debug="$PEKIT_OUT/debug/usr/lib/debug/.build-id/$(printf %s "$build_id" | cut -c1-2)/$(printf %s "$build_id" | cut -c3-).debug"
@@ -194,7 +218,10 @@ for elf in "$PEKIT_OUT/usr/sbin/prelude" "$PEKIT_OUT/usr/bin/seed-sd"; do
   readelf -SW "$debug" | grep -q '\.debug_info'
   test "$(readelf -n "$debug" | sed -n 's/^[[:space:]]*Build ID: //p' | head -1)" = "$build_id"
   for forbidden in "$SRC" "$PEKIT_OUT_BASE" "$PEKIT_WORKSPACE_ROOT"; do
-    ! grep -aF "$forbidden" "$elf" "$debug" >/dev/null
+    if grep -aF "$forbidden" "$elf" "$debug" >/dev/null; then
+      echo "prelude: build path $forbidden leaked into $elf or its debug file" >&2
+      exit 1
+    fi
   done
 done
 
@@ -214,7 +241,7 @@ test "$actual" = '[  OK  ] fixture: mounted'
 "org.git.kernel.dash" = "*"
 "org.rust-lang.rust" = ">= 1.98.1"
 "org.rust-lang.rust-std-x86-64-unknown-linux-musl" = ">= 1.98.1"
-"org.llvm.lld" = ">= 22, < 23"
+"org.llvm.lld" = ">= 22"
 "org.gnu.binutils" = "*"
 "org.gnu.findutils" = "*"
 "org.gnu.grep" = "*"
