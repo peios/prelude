@@ -8,7 +8,7 @@ dependencies  = "consistent"
 architecture  = "consistent"
 
 [build]
-dependencies.providers = ["peipkg", "apt"]
+dependencies.providers = ["peipkg"]
 test = true
 
 [payload]
