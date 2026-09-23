@@ -43,4 +43,4 @@ soname      = true
 [allow]
 "payload.manpages.required" = "Prelude and seed-sd are internal initramfs implementation interfaces, not interactive operator commands"
 "elf.relr" = "The self-contained static musl PIE has no dynamic shared-library relocation table to compress"
-"elf.cet" = "Rust's self-contained musl target does not emit GNU CET property notes; the binaries remain static PIE with NX and full RELRO"
+"elf.cet" = "All Rust code is built with -Zcf-protection=full; the static musl libc's x86_64 assembly (memcpy, memmove, memset) has no ENDBR or CET property note and musl has no shadow-stack support (PEI-1159)"

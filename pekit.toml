@@ -46,7 +46,11 @@ if versions != [expected]:
 # raw GNU-ld arguments, not the `-Wl,` driver syntax used by ordinary Peios
 # Rust packages. The security policy is otherwise equivalent.
 REMAP_RUSTFLAGS="--remap-path-prefix=$PEKIT_WORKSPACE_ROOT=/usr/src/debug/dev.peios.prelude/.workspace --remap-path-prefix=$PEKIT_OUT_BASE=/usr/src/debug/dev.peios.prelude/.build --remap-path-prefix=$SRC=/usr/src/debug/dev.peios.prelude"
-MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C link-arg=--build-id=sha1 $REMAP_RUSTFLAGS"
+# Control-flow protection (PEI-1155): Peios' musl std and self-contained CRT
+# are CET-instrumented (org.rust-lang.rust); stable rustc instruments these
+# crates only under -Zcf-protection, via the escape hatch the Rust recipe uses.
+MUSL_RUSTFLAGS="-Zcf-protection=full -C target-feature=+crt-static -C link-arg=-z -C link-arg=relro -C link-arg=-z -C link-arg=now -C link-arg=--build-id=sha1 $REMAP_RUSTFLAGS"
+export RUSTC_BOOTSTRAP=1
 export RUSTFLAGS=$MUSL_RUSTFLAGS
 
 # Peios ships this target as a package. Debian does not ship a precompiled
