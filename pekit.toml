@@ -184,20 +184,6 @@ test -n "$(find "$DEBUG_ROOT" -type f -print -quit)"
 "org.sourceware.debugedit" = "*"
 "org.python.python3" = "*"
 
-[build.main.dependencies.apt]
-build-essential = "*"
-dash = "*"
-cargo = "*"
-rustc = "*"
-binutils = "*"
-findutils = "*"
-grep = "*"
-debugedit = "*"
-python3 = "*"
-musl-tools = "*"
-rust-src = "*"
-libunwind-19-dev = "*"
-
 [test]
 gate = true
 needs = ["main"]
@@ -257,20 +243,6 @@ test "$actual" = '[  OK  ] fixture: mounted'
 "org.gnu.grep" = "*"
 "org.sourceware.debugedit" = "*"
 "org.python.python3" = "*"
-
-[test.dependencies.apt]
-build-essential = "*"
-dash = "*"
-cargo = "*"
-rustc = "*"
-binutils = "*"
-findutils = "*"
-grep = "*"
-debugedit = "*"
-python3 = "*"
-musl-tools = "*"
-rust-src = "*"
-libunwind-19-dev = "*"
 
 [clean]
 command = "cargo clean"
