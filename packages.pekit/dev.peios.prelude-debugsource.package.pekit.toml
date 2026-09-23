@@ -2,10 +2,10 @@
 name         = "dev.peios.prelude-debugsource"
 architecture = "noarch"
 description  = "Peios initramfs runtime debug sources"
+# The same crate closure as prelude; checked by build.main.
+license      = "((MIT OR Apache-2.0) AND Unicode-3.0) AND (Apache-2.0 OR MIT) AND MIT"
 
 [files]
 "@source:LICENSE" = "usr/share/licenses/dev.peios.prelude-debugsource/LICENSE"
-":usr/share/licenses/dev.peios.prelude/Apache-2.0.txt" = "usr/share/licenses/dev.peios.prelude-debugsource/Apache-2.0.txt"
-":usr/share/licenses/dev.peios.prelude/Unicode-3.0.txt" = "usr/share/licenses/dev.peios.prelude-debugsource/Unicode-3.0.txt"
-":usr/share/licenses/dev.peios.prelude/compiler-builtins.txt" = "usr/share/licenses/dev.peios.prelude-debugsource/compiler-builtins.txt"
+":licenses/**" = "usr/share/licenses/dev.peios.prelude-debugsource/third-party"
 ":usr/src/debug/**" = "usr/src/debug"
