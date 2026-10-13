@@ -9,7 +9,8 @@
 // pair it with, is gone), so changing it changes every seeded tree.
 //
 // The SD: owner=SYSTEM, group=SYSTEM, DACL = [Allow SYSTEM GenericAll OI|CI,
-// Allow BUILTIN\Administrators GenericAll OI|CI]. Inheritable so anything
+// Allow BUILTIN\Administrators GenericAll OI|CI, Allow CREATOR OWNER
+// GenericAll OI|CI|IO]. Inheritable so anything
 // created under the mount picks up the same default via KACS's
 // inode_init_security inheritance — which means this ACL is, in practice, the
 // access policy of the entire tree. See build_seed_sd for why Administrators
@@ -200,7 +201,8 @@ fn sddl_problem(e: &libp_sd::sddl::SddlError) -> String {
 }
 
 /// Build the default SYSTEM-owned seed SD: Allow SYSTEM and Allow
-/// BUILTIN\Administrators, both GenericAll and both OI|CI.
+/// BUILTIN\Administrators, both GenericAll and both OI|CI, plus Allow
+/// CREATOR OWNER GenericAll OI|CI|IO (inherit-only).
 ///
 /// # Why Administrators is here
 ///
@@ -219,10 +221,11 @@ fn sddl_problem(e: &libp_sd::sddl::SddlError) -> String {
 /// Mirrors the default the registry already uses for the same question
 /// (`loregd/internal/sd/sd.go`): SYSTEM and Administrators full.
 ///
-/// peinit's `PHASE1_SEED_SDDL` (`src/init/linux/mounts.rs`) is a hand copy of
-/// this descriptor for the mounts peinit creates itself. The two MUST stay
-/// identical; the last time they drifted, Administrators was added here and
-/// not there (PEI-223).
+/// peinit's `PHASE1_SEED_SDDL` (`src/init/linux/mounts.rs`) is related but
+/// deliberately wider: it also grants Everyone read+execute with CI only,
+/// so services can reach their own runtime directories. Both descriptors
+/// carry the SYSTEM, Administrators and inherit-only CREATOR OWNER entries;
+/// their complete DACLs must not be made identical.
 ///
 /// # What is deliberately *not* here
 ///
