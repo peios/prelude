@@ -1,7 +1,7 @@
 [package]
 name        = "seed-sd"
 version     = "0.0.7"
-description = "Initramfs helper: seed a default Allow-SYSTEM-GenericAll SD on a path via kacs_set_sd. Used by prelude hooks immediately after mounting a fresh tmpfs to dodge KACS DENY_MISSING."
+description = "Seed bootstrap security descriptors on initramfs paths and filesystem trees."
 edition     = "2021"
 license     = "MIT"
 publish     = false
@@ -10,8 +10,5 @@ publish     = false
 name = "seed-sd"
 path = "src/main.rs"
 
-# libp-sd provides the SD builders + the kacs_set_sd syscall wrapper.
-# Use the tagged public libp-rs repo so standalone prelude checkouts build
-# in the package farm without requiring a monorepo-relative sibling checkout.
 [dependencies]
-libp-sd = { git = "https://github.com/peios/libp-rs.git", tag = "v0.1.0", package = "libp-sd" }
+peios = { git = "https://github.com/peios/peios-rs.git", rev = "26ac6968cec4cb7f887198aa3fb9268096660831", features = ["static"] }

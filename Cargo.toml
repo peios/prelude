@@ -2,6 +2,10 @@
 resolver = "2"
 members  = ["crates/prelude", "crates/seed-sd"]
 
+[workspace.package]
+version = "0.0.7"
+license = "MIT"
+
 # Shared release profile. prelude is a size-critical initramfs PID 1, so
 # the settings are tuned for size over speed.
 [profile.release]

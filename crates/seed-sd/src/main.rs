@@ -63,7 +63,13 @@
 //
 // Exits 0 on success, 2 on usage error, 1 if any node could not be seeded.
 
+use std::path::Path;
 use std::process::ExitCode;
+
+use peios::file::{self, OpenFlags, SecInfo};
+use peios::security::{
+    AccessMask, AceFlags, AclBuilder, SdBuilder, SecurityDescriptor, Sid, WellKnown,
+};
 
 fn main() -> ExitCode {
     let mut recursive = false;
@@ -164,39 +170,12 @@ fn usage(prog: &str, problem: &str) -> ExitCode {
 /// default would stamp a *narrower* policy than the caller asked for, and the
 /// symptom of that arrives much later and somewhere else — a service that
 /// cannot reach the filesystem, with nothing pointing back to a typo here.
-fn build_sd(sddl: Option<&str>) -> Result<Vec<u8>, String> {
+fn build_sd(sddl: Option<&str>) -> Result<SecurityDescriptor, String> {
     match sddl {
-        Some(text) => libp_sd::sddl::parse(text)
-            .map_err(|e| format!("parse {text:?}: {}", sddl_problem(&e)))?
-            .build()
-            .map_err(|e| format!("build {text:?}: {}", render(e))),
-        None => build_seed_sd(),
-    }
-}
-
-/// A libp-sd error as a person reads it rather than as Rust prints it.
-///
-/// `{:?}` on the library's error type gives `Syscall(Errno(95))` — a numeric
-/// errno inside two layers of Rust type name — where the operator wanted
-/// "Operation not supported". The `From<Error> for std::io::Error` conversion
-/// maps a syscall error onto the platform's own strerror text and leaves every
-/// other variant as its `Display`, which is exactly the split wanted here.
-fn render(e: libp_sd::Error) -> String {
-    std::io::Error::from(e).to_string()
-}
-
-/// The SDDL parser's verdict, with the one misleading variant translated.
-///
-/// `Empty` is what the parser returns for input carrying no `O:`, `G:`, `D:`
-/// or `S:` section — so `--sddl 'not a descriptor'` reports "empty SDDL
-/// input", which reads as a complaint that the string was empty when the
-/// operator can see that it was not.
-fn sddl_problem(e: &libp_sd::sddl::SddlError) -> String {
-    match e {
-        libp_sd::sddl::SddlError::Empty => {
-            "no O:, G:, D: or S: section — this is not a security descriptor".to_string()
+        Some(text) => {
+            peios::security::sddl::parse(text).map_err(|error| format!("parse {text:?}: {error}"))
         }
-        other => other.to_string(),
+        None => build_seed_sd(),
     }
 }
 
@@ -248,62 +227,37 @@ fn sddl_problem(e: &libp_sd::sddl::SddlError) -> String {
 /// A caller that needs the access policy of a running system passes `--sddl`
 /// instead of widening this, precisely so the /dev case above does not inherit
 /// the widening along with it.
-fn build_seed_sd() -> Result<Vec<u8>, String> {
-    use libp_sd::consts::{
-        ACCESS_GENERIC_ALL, ACE_FLAG_CONTAINER_INHERIT, ACE_FLAG_INHERIT_ONLY,
-        ACE_FLAG_OBJECT_INHERIT,
-    };
-    let inheritable = ACE_FLAG_OBJECT_INHERIT | ACE_FLAG_CONTAINER_INHERIT;
-    let system = libp_sd::AceBuilder::allow(libp_sd::WellKnownSid::LocalSystem, ACCESS_GENERIC_ALL)
-        .flags(inheritable);
-    let administrators = libp_sd::AceBuilder::allow(
-        libp_sd::WellKnownSid::BuiltinAdministrators,
-        ACCESS_GENERIC_ALL,
-    )
-    .flags(inheritable);
-    // Whoever creates an object gets full control of it. Inherit-only, so it
-    // grants nothing on the node it sits on; KACS resolves it per created
-    // object and carries the rule onward down each container.
-    //
-    // Without it a non-SYSTEM principal can create a file it cannot read back.
-    // The two ACEs above are inheritable, so a created file arrives with a
-    // non-empty DACL naming only SYSTEM and Administrators — and a token's
-    // default DACL is consulted only when inheritance yields nothing at all,
-    // so it never gets a look in (PEI-546).
-    //
-    // This one is not a widening. It never names a principal: it grants the
-    // creator rights over its own object and nobody rights over anybody
-    // else's, which is why it belongs in the bootstrap descriptor when an
-    // Everyone ACE does not.
-    //
-    // Spelled as a literal SID because `WellKnownSid` has no CREATOR OWNER
-    // variant and neither SDDL vocabulary has a `CO` alias.
-    let creator_owner_sid = libp_sd::sddl::parse_sid("S-1-3-0")
-        .map_err(|e| format!("CREATOR OWNER sid: {}", sddl_problem(&e)))?;
-    let creator_owner = libp_sd::AceBuilder::allow(creator_owner_sid, ACCESS_GENERIC_ALL)
-        .flags(inheritable | ACE_FLAG_INHERIT_ONLY);
-    let dacl = libp_sd::AclBuilder::new()
-        .ace(system)
-        .ace(administrators)
-        .ace(creator_owner);
-    libp_sd::SdBuilder::new()
-        .owner(libp_sd::WellKnownSid::LocalSystem)
-        .group(libp_sd::WellKnownSid::LocalSystem)
-        .dacl(dacl)
+fn build_seed_sd() -> Result<SecurityDescriptor, String> {
+    let system = Sid::well_known(WellKnown::System);
+    let administrators = Sid::well_known(WellKnown::Administrators);
+    let creator = Sid::well_known(WellKnown::CreatorOwner);
+    let inherited = AceFlags::OBJECT_INHERIT | AceFlags::CONTAINER_INHERIT;
+    let full = AccessMask::GENERIC_ALL.bits();
+    let acl = AclBuilder::new()
+        .allow(&system, full, inherited)
+        .allow(&administrators, full, inherited)
+        .allow(&creator, full, inherited | AceFlags::INHERIT_ONLY)
         .build()
-        .map_err(render)
+        .map_err(|error| error.to_string())?;
+    SdBuilder::new()
+        .owner(&system)
+        .group(&system)
+        .dacl(&acl)
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 /// Stamp the seed SD (owner + group + dacl) onto one path. A symlink is
 /// stamped as itself, never followed.
-fn seed_one(path: &str, sd: &[u8]) -> Result<(), String> {
-    let info = libp_sd::SecurityInfo::owner().with_group().with_dacl();
-    let target = libp_sd::SdTarget::Path {
-        dirfd: libp_sd::raw::FDCWD,
-        path,
-        no_follow_symlinks: true,
-    };
-    libp_sd::set_sd(&target, info, sd).map_err(|e| format!("set_sd {path}: {}", render(e)))
+fn seed_one(path: &str, sd: &SecurityDescriptor) -> Result<(), String> {
+    file::set_sd(
+        None,
+        Path::new(path),
+        SecInfo::OWNER | SecInfo::GROUP | SecInfo::DACL,
+        sd,
+        OpenFlags::SYMLINK_NOFOLLOW.bits() as i32,
+    )
+    .map_err(|error| format!("set_sd {path}: {error}"))
 }
 
 /// Seed `path`, then descend into it if it is a directory. `path` is seeded
@@ -315,7 +269,7 @@ fn seed_one(path: &str, sd: &[u8]) -> Result<(), String> {
 /// Best-effort: every failure is reported on stderr and counted, and the walk
 /// goes on. Returns the number of nodes that could not be seeded. A directory
 /// that could not be read counts once and is not descended into.
-fn seed_recursive(path: &str, sd: &[u8]) -> usize {
+fn seed_recursive(path: &str, sd: &SecurityDescriptor) -> usize {
     let mut failures = 0;
     if let Err(e) = seed_one(path, sd) {
         eprintln!("seed-sd: {e}");
@@ -356,4 +310,36 @@ fn seed_recursive(path: &str, sd: &[u8]) -> usize {
         failures += seed_recursive(child, sd);
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_sd, build_seed_sd, Sid, WellKnown};
+
+    #[test]
+    fn default_descriptor_matches_original_builder_bytes() {
+        let actual = build_seed_sd().unwrap();
+        assert_eq!(
+            actual.as_bytes(),
+            include_bytes!("../tests/fixtures/bootstrap.sd")
+        );
+        let view = actual.view().unwrap();
+        assert_eq!(view.owner().unwrap(), &*Sid::well_known(WellKnown::System));
+        assert_eq!(view.group().unwrap(), &*Sid::well_known(WellKnown::System));
+        assert_eq!(view.dacl().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn explicit_descriptor_replaces_the_default() {
+        let descriptor = build_sd(Some("O:SYG:SYD:(A;;GA;;;SY)")).unwrap();
+        assert_ne!(descriptor.as_bytes(), build_seed_sd().unwrap().as_bytes());
+        assert_eq!(descriptor.view().unwrap().dacl().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_descriptor_is_not_replaced_with_bootstrap_policy() {
+        for text in ["", "not a descriptor", "O:not-a-sid", "D:(A;;GA;;;invalid)"] {
+            assert!(build_sd(Some(text)).is_err(), "{text:?}");
+        }
+    }
 }

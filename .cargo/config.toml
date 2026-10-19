@@ -1,25 +1,5 @@
+# Bazel is the canonical build interface. Cargo remains available for focused
+# development with an explicitly selected compatible static Peios SDK.
 [target.x86_64-unknown-linux-musl]
-linker    = "ld.lld"
+linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static"]
-
-[build]
-target = "x86_64-unknown-linux-musl"
-
-# Release builds are network-independent. `cargo vendor --locked vendor`
-# refreshes this closure when Cargo.lock changes; Pekit refuses a dirty lock
-# and always invokes Cargo with both --locked and --offline.
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/peios/libp-rs.git?tag=v0.1.0"]
-git = "https://github.com/peios/libp-rs.git"
-tag = "v0.1.0"
-replace-with = "vendored-sources"
-
-[source."git+https://github.com/peios/pkm?tag=uapi/rust/v0.1.0"]
-git = "https://github.com/peios/pkm"
-tag = "uapi/rust/v0.1.0"
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
