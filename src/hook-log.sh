@@ -43,6 +43,8 @@ hook_log_init() {
     # parents do.
     HOOK_LOG_COLOUR=1
     if [ -r /proc/cmdline ]; then
+        # Kernel command-line settings are whitespace-separated words.
+        # shellcheck disable=SC2013
         for _tok in $(cat /proc/cmdline); do
             case "$_tok" in
             TERM=dumb) HOOK_LOG_COLOUR=0 ;;
@@ -60,9 +62,10 @@ _hook_log_emit() {
     _sgr=$2
     _msg=$3
     if [ "${HOOK_LOG_COLOUR:-1}" = 1 ] && [ -n "$_sgr" ]; then
-        # printf %b so the \033 is interpreted; the tag is padded OUTSIDE the
-        # escapes so colour never moves the column.
-        printf '%b\n' "[\033[${_sgr}m${_tag}\033[0m] ${HOOK_LOG_COMPONENT:-hook}: ${_msg}"
+        # Only the fixed format interprets escapes. Component and message
+        # text are literal even when filenames contain backslashes or %.
+        printf '[\033[%sm%s\033[0m] %s: %s\n' \
+            "$_sgr" "$_tag" "${HOOK_LOG_COMPONENT:-hook}" "$_msg"
     else
         printf '%s\n' "[${_tag}] ${HOOK_LOG_COMPONENT:-hook}: ${_msg}"
     fi
