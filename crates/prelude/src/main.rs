@@ -8,26 +8,26 @@
 //   - chroot into it and exec the real PID 1
 //
 // prelude is the invariant skeleton; everything deployment-specific is a
-// hook. Mounting the real root is a hook's job — prelude only provides
-// the /mnt/rootfs mountpoint and verifies the result. It does not resolve
-// the hook DAG either: mkirf does that at build time and writes
+// hook. Mounting the real root is a hook's job; prelude provides
+// the /mnt/rootfs mountpoint and verifies the result. mkirf resolves the
+// hook declarations at build time and writes
 // /system/prelude/hooks.seq.<n>; prelude reads the newest version it
-// understands and runs it. See boot-design.md.
+// understands and schedules its hooks. See docs/architecture.md.
 //
 // Built static against musl, no external crates. std for fs/io/env/
 // process; raw libc FFI for the syscalls std doesn't expose (mount,
 // chroot, reboot, execve, fork, waitpid, sync).
 
-#![allow(clippy::missing_safety_doc)]
+mod console;
 
 use core::ffi::{c_int, c_ulong};
 use std::cell::Cell;
 use std::ffi::CString;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+use console::{banner, init_colour, init_quiet, log, log_err, log_ok, log_warn};
 
 const MS_NOSUID: c_ulong = 2;
 const MS_NODEV: c_ulong = 4;
@@ -145,9 +145,10 @@ fn cstr(s: &str) -> CString {
 
 fn try_mkdir(path: &str) {
     let p = cstr(path);
-    unsafe {
-        mkdir(p.as_ptr() as *const u8, 0o755);
-    }
+    // SAFETY: p owns a live NUL-terminated path for the duration of mkdir.
+    // Existing directories are expected. A mount or later filesystem operation
+    // reports a failure if the directory could not be made usable.
+    let _ = unsafe { mkdir(p.as_ptr() as *const u8, 0o755) };
 }
 
 fn do_mount(
@@ -167,6 +168,8 @@ fn do_mount(
     let d_ptr = d
         .as_ref()
         .map_or(core::ptr::null(), |c| c.as_ptr() as *const u8);
+    // SAFETY: all non-null pointers refer to live NUL-terminated strings.
+    // Optional filesystem and data arguments are null when absent.
     let rc = unsafe {
         mount(
             s.as_ptr() as *const u8,
@@ -187,7 +190,7 @@ fn do_mount(
 // mounted.
 //
 // The kernel stamps the devtmpfs root SYSTEM-only at init (devtmpfs_init, see
-// pkm's devtmpfs-seed-root-sd.patch). That is plumbing, not policy: it exists
+// the kernel's drivers/base/devtmpfs.c). That is plumbing, not policy: it exists
 // so kdevtmpfs can create nodes at all under DENY_MISSING, and SYSTEM-only is
 // the right descriptor for that one job. But every node kdevtmpfs has created
 // since inherited that single ACE, so on an unseeded /dev an administrator
@@ -222,182 +225,6 @@ fn seed_dev() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The console line format
-//
-// Shared with peinit by SPECIFICATION, not by code. prelude is a size-critical
-// initramfs PID 1 with zero dependencies, and the only crate it could share
-// with peinit (peios-rs) binds libpeios over FFI — coupling the initramfs PID 1
-// to the kernel-boundary library to save forty lines of string formatting is a
-// bad trade. The format is documented in the docs tree; these forty lines are
-// prelude's implementation of it, and peinit's `console_style` is peinit's.
-//
-// Keep the two in step: the tag words, the field width and the banner width are
-// the contract, and a hook script rendering a third copy is held to it too.
-// ---------------------------------------------------------------------------
-
-/// Width of the tag field between the brackets.
-const TAG_WIDTH: usize = 6;
-/// Total banner width, including the two leading spaces. Fits inside 80
-/// columns, which is what both a VT and a serial console give you.
-const BANNER_WIDTH: usize = 64;
-
-/// What happened, as far as the console is concerned.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tag {
-    /// Progress with no outcome yet. An empty bracket: it holds the column
-    /// while receding, so OK and FAILED are what catch the eye.
-    None,
-    /// It worked. The verb should agree — "mounted /bin", never "mounting".
-    Ok,
-    /// Something is wrong but the boot continues.
-    Warn,
-    /// Something did not work.
-    Failed,
-}
-
-impl Tag {
-    fn word(self) -> &'static str {
-        match self {
-            Tag::None => "",
-            Tag::Ok => "OK",
-            Tag::Warn => "WARN",
-            Tag::Failed => "FAILED",
-        }
-    }
-
-    fn sgr(self) -> Option<&'static str> {
-        match self {
-            Tag::None => None,
-            Tag::Ok => Some("1;32"),
-            Tag::Warn => Some("1;33"),
-            Tag::Failed => Some("1;31"),
-        }
-    }
-}
-
-/// Whether to emit SGR escapes. systemd's rule: colour unless the terminal is
-/// declared dumb. prelude has no inherited TERM (it is PID 1), so the kernel
-/// command line is the only place an operator can say so.
-static COLOUR: AtomicBool = AtomicBool::new(true);
-
-fn init_colour(cmdline: &str) {
-    let dumb = cmdline
-        .split_whitespace()
-        .filter_map(|token| token.strip_prefix("TERM="))
-        .next_back()
-        .is_some_and(|value| value == "dumb");
-    COLOUR.store(!dumb, Ordering::Relaxed);
-}
-
-fn render(tag: Tag, component: &str, message: &str) -> String {
-    render_with(tag, component, message, COLOUR.load(Ordering::Relaxed))
-}
-
-/// The renderer proper, colour passed in so the layout is testable without a
-/// process-wide flag that parallel tests would race on.
-fn render_with(tag: Tag, component: &str, message: &str, colour: bool) -> String {
-    let word = tag.word();
-    let spare = TAG_WIDTH.saturating_sub(word.len());
-    let left = spare / 2;
-    let right = spare - left;
-    let tagged = match (colour, tag.sgr()) {
-        (true, Some(sgr)) => format!("\x1b[{sgr}m{word}\x1b[0m"),
-        _ => word.to_string(),
-    };
-    format!(
-        "[{}{}{}] {component}: {message}",
-        " ".repeat(left),
-        tagged,
-        " ".repeat(right)
-    )
-}
-
-/// The stage banner: punctuation between one PID 1 and the next.
-///
-/// prelude's says the initramfs is in charge; peinit prints the matching one
-/// when the real root takes over. Same width and same shape, so the two read as
-/// a sequence rather than as two unrelated decorations.
-fn banner() {
-    // Status, not news: the banner is the first thing a blackout should remove.
-    if BLACKOUT.load(Ordering::Relaxed) {
-        return;
-    }
-    let text = banner_text(
-        "prelude · initramfs · PID 1",
-        concat!("v", env!("CARGO_PKG_VERSION")),
-        COLOUR.load(Ordering::Relaxed),
-    );
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
-}
-
-fn banner_text(stage: &str, version: &str, colour: bool) -> String {
-    let rule = "═".repeat(BANNER_WIDTH - 2);
-    // Character count, not byte length: the rule and the separator are both
-    // multi-byte.
-    let used = 3 + stage.chars().count() + version.chars().count();
-    let gap = " ".repeat(BANNER_WIDTH.saturating_sub(used).max(1));
-    if colour {
-        format!(
-            "\n  \x1b[2m{rule}\x1b[0m\n   \x1b[1m{stage}\x1b[0m{gap}\x1b[2m{version}\x1b[0m\n  \x1b[2m{rule}\x1b[0m\n\n"
-        )
-    } else {
-        format!("\n  {rule}\n   {stage}{gap}{version}\n  {rule}\n\n")
-    }
-}
-
-/// `peios.quiet=2` — the console blackout, honoured here because prelude writes
-/// to the same console peinit does and a half-silenced boot is not silence.
-///
-/// Only level 2 reaches prelude. The other half of the policy — staying out of
-/// a terminal a service owns — has no meaning before any service exists, and
-/// prelude exits before the first one starts.
-static BLACKOUT: AtomicBool = AtomicBool::new(false);
-
-/// Read the blackout preference. Must be called once /proc is mounted; before
-/// that the cmdline is unreadable and prelude logs unconditionally, which is
-/// the right default for output that would otherwise be lost.
-fn init_quiet(cmdline: &str) {
-    let blackout = cmdline
-        .split_whitespace()
-        .filter_map(|token| token.strip_prefix("peios.quiet="))
-        .next_back()
-        .is_some_and(|value| value == "2");
-    BLACKOUT.store(blackout, Ordering::Relaxed);
-}
-
-/// Ordinary progress with no outcome yet. Silenced by `peios.quiet=2`.
-fn log(msg: &str) {
-    log_tagged(Tag::None, msg);
-}
-
-/// Something worked. Silenced by `peios.quiet=2` exactly as [`log`] is: a
-/// success is progress, and the tag is presentation rather than news.
-fn log_ok(msg: &str) {
-    log_tagged(Tag::Ok, msg);
-}
-
-fn log_tagged(tag: Tag, msg: &str) {
-    if BLACKOUT.load(Ordering::Relaxed) {
-        return;
-    }
-    eprint!("{}", render(tag, "prelude", &format!("{msg}\n")));
-}
-
-/// Something is wrong but the boot continues. Never silenced, like [`log_err`].
-fn log_warn(msg: &str) {
-    eprint!("{}", render(Tag::Warn, "prelude", &format!("{msg}\n")));
-}
-
-/// Something went wrong. Never silenced: a blackout is a preference about
-/// noise, not an instruction to hide a failure — and prelude's failures cost
-/// the boot.
-fn log_err(msg: &str) {
-    eprint!("{}", render(Tag::Failed, "prelude", &format!("{msg}\n")));
-}
-
 // Returns the init= value from /proc/cmdline if present.
 //
 // The LAST occurrence wins, as it does for every repeated kernel parameter and
@@ -419,8 +246,7 @@ fn cmdline_init_from(cmdline: &str) -> Option<String> {
     cmdline
         .split_whitespace()
         .filter_map(|tok| tok.strip_prefix("init="))
-        .filter(|v| !v.is_empty())
-        .next_back()
+        .rfind(|v| !v.is_empty())
         .map(str::to_string)
 }
 
@@ -677,10 +503,8 @@ fn read_hook_seq() -> std::io::Result<Vec<SeqHook>> {
 //     provides root-mounted
 //     requires early-topology
 //
-// The declaration lines are validated but not yet acted on: this prelude
-// runs the stanzas top to bottom, which is exactly what version 1 encoded.
-// Scheduling from the declarations is a later change; parsing them strictly
-// now means an image cannot carry a manifest we would misread then.
+// The validated declarations drive runtime capability scheduling. Sequence
+// order determines the order in which ready hooks are considered.
 fn parse_hook_seq_v2<'a>(
     path: &str,
     lines: impl Iterator<Item = &'a str>,
@@ -774,6 +598,8 @@ fn check_requires_are_supplied(path: &str, hooks: &[SeqHook]) -> std::io::Result
 // A signal or a stop is surfaced as an error whatever the code would have
 // been — a child killed mid-write has not "declined" anything.
 fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
+    // SAFETY: the boot process is single-threaded and owns no worker threads.
+    // The child execs or exits without returning into the boot pipeline.
     let pid = unsafe { fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
@@ -793,11 +619,15 @@ fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
             path_env.as_ptr() as *const u8,
             core::ptr::null(),
         ];
+        // SAFETY: the path and strings outlive this call; argv and envp are
+        // null-terminated arrays of pointers to NUL-terminated strings.
         unsafe { execve(p.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
         log(&format!(
             "{path}: exec failed: {}",
             std::io::Error::last_os_error(),
         ));
+        // SAFETY: this is the forked child after exec failed. _exit avoids
+        // running parent cleanup and cannot return.
         unsafe { _exit(127) };
     }
     let mut status: c_int = 0;
@@ -805,6 +635,7 @@ fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
     // Without it `waitpid` returns only on termination, and a hook that takes a
     // job-control stop leaves prelude blocked with nothing in the initramfs
     // able to resume it: no job control, no other process, no timeout.
+    // SAFETY: pid identifies our child and status is writable for this call.
     if unsafe { waitpid(pid, &mut status, WUNTRACED) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -812,8 +643,11 @@ fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
         // The child is stopped, not gone. Nothing will ever send it SIGCONT, so
         // kill it and reap it here rather than carry a stopped process — and a
         // zombie after it — into the new root's namespace.
+        // SAFETY: waitpid reported this owned child stopped, so its PID has
+        // not been released for reuse. SIGKILL is a valid signal.
         unsafe { kill(pid, SIGKILL) };
         let mut reaped: c_int = 0;
+        // SAFETY: reaped is writable, and pid still names our child.
         unsafe { waitpid(pid, &mut reaped, 0) };
     }
     if status & 0x7f != 0 {
@@ -825,7 +659,8 @@ fn spawn_and_wait(path: &str, args: &[&str]) -> std::io::Result<c_int> {
 
 // Run one hook and wait for it. The hook is a script; the kernel honours its
 // `#!/usr/bin/sh` shebang, which resolves through dash's sh claim.
-// A hook that does not exit 0 fails the boot.
+// Status 0 satisfies the hook, 69 declines it, and 75 defers it; other
+// nonzero exits fail the boot.
 fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
     let status = spawn_and_wait(path, &[])
         .map_err(|e| std::io::Error::new(e.kind(), format!("hook {e}")))?;
@@ -846,6 +681,8 @@ fn run_one_hook(path: &str) -> std::io::Result<Outcome> {
 // exit, and a failure shell lets prelude halt cleanly with no "killed init".
 fn rescue_shell(reason: &str) {
     log(reason);
+    // SAFETY: the boot process is single-threaded and owns no worker threads.
+    // The child execs or exits without returning into the boot pipeline.
     let pid = unsafe { fork() };
     if pid < 0 {
         log(&format!(
@@ -870,14 +707,19 @@ fn rescue_shell(reason: &str) {
             path_env.as_ptr() as *const u8,
             core::ptr::null(),
         ];
+        // SAFETY: the path and strings outlive this call; argv and envp are
+        // null-terminated arrays of pointers to NUL-terminated strings.
         unsafe { execve(p.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr()) };
         log(&format!(
             "rescue: exec {RESCUE_SHELL} failed: {}",
             std::io::Error::last_os_error(),
         ));
+        // SAFETY: this is the forked child after exec failed. _exit avoids
+        // running parent cleanup and cannot return.
         unsafe { _exit(127) };
     }
     let mut status: c_int = 0;
+    // SAFETY: pid identifies our child and status is writable for this call.
     if unsafe { waitpid(pid, &mut status, 0) } < 0 {
         log(&format!(
             "rescue: waitpid failed: {}",
@@ -998,7 +840,9 @@ fn stuck_reason(hooks: &[SeqHook], state: &[Option<Outcome>]) -> String {
                 // case above as well, so it does nothing to tell the two apart —
                 // and `after`, in this exact state, already says the precise
                 // thing. The two relationships describe one condition one way.
-                why.push(format!("`{cap}` — not settled (a supplier has not finished)"));
+                why.push(format!(
+                    "`{cap}` — not settled (a supplier has not finished)"
+                ));
             }
         }
         for cap in &h.after {
@@ -1080,17 +924,8 @@ fn schedule_hooks(
     }
 }
 
-// The real work. Returns only on failure — success exits via execve. A
-// breakpoint (rd.break) pauses mid-hooks but then resumes, so it does not
-// change that contract.
-//
-// `shell_on_failure` is how the debug knobs reach the caller. It is set the
-// moment phase 1 reads the command line and is never unset, so a failure in
-// phases 5 to 7 — after `/proc` has been mount-moved into the new root and
-// `/proc/cmdline` no longer exists — is still answered by what the operator
-// actually asked for. Left `None` only when the boot failed before the read,
-// which is the one case the caller has to go and look for itself.
-fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
+/// Prepare the private mount namespace and seed devtmpfs before hooks run.
+fn mount_virtual_filesystems() -> std::io::Result<()> {
     // Phase 0: make the rootfs and all descendant mounts private so that
     // mount-move (phase 5) and the root pivot (phase 7) aren't blocked by
     // shared-mount propagation. Modern kernels default new mounts to shared
@@ -1120,46 +955,11 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
     }
     seed_dev();
 
-    // The cmdline becomes readable here and not before — main runs ahead of any
-    // mount. Quiet is read first so the banner and everything after it can
-    // honour it; the handful of lines before this point are unconditional
-    // because prelude cannot obey a preference it has not read.
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    init_quiet(&cmdline);
-    init_colour(&cmdline);
+    Ok(())
+}
 
-    banner();
-
-    // Debug breakpoints, from the same read.
-    let breaks = Breakpoints::from_cmdline(&cmdline);
-    // And the answer to "open a shell if this boot fails?", banked now while
-    // the command line is still readable. Any rd.break implies rd.shell.
-    shell_on_failure.set(Some(
-        cmdline_has(&cmdline, "rd.shell") || breaks.any(),
-    ));
-
-    // Phase 2: figure out the target init.
-    let target_init = match cmdline_init() {
-        Some(v) => {
-            log(&format!("target init from cmdline: {v}"));
-            v
-        }
-        None => {
-            log("no init= on cmdline; will try fallback chain on the new root");
-            String::new()
-        }
-    };
-
-    // Phase 3: run the initramfs hooks. The kernel virtual filesystems
-    // are up — a hook may need them. prelude provides an empty /mnt/rootfs
-    // mountpoint; mounting a real root onto it is a hook's job (the root
-    // filesystem varies by deployment, so it is never hardcoded here).
-    // mkirf resolved the hook order at build time; we just run the list.
-    // /mnt may not exist in an initramfs whose base filesystem predates it.
-    try_mkdir("/mnt");
-    try_mkdir(ROOTFS);
-    run_hooks(&breaks)?;
-
+/// Move the live mounts, clear the old initramfs, and enter the selected root.
+fn handoff_root() -> std::io::Result<()> {
     // Phase 4: a hook must have mounted the real root at /mnt/rootfs. If it
     // is still on the initramfs's own device, nothing mounted it.
     if fs::metadata(ROOTFS)?.dev() == fs::metadata("/")?.dev() {
@@ -1171,7 +971,7 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
 
     // Phase 5: move kernel vfs into the new root so the new PID 1 has them.
     // The squashfs is RO and must ship /proc, /sys, /dev as empty
-    // mountpoint dirs — build-staging.sh creates them.
+    // mountpoint directories provided by the image composer.
     for sub in &["proc", "sys", "dev"] {
         let from = format!("/{sub}");
         let to = format!("{ROOTFS}/{sub}");
@@ -1196,6 +996,8 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
     log("pivot: chdir rootfs");
     let rootfs_c = cstr(ROOTFS);
     let slash_c = cstr("/");
+    // SAFETY: both paths are live NUL-terminated strings. Boot owns the
+    // process filesystem context; no other thread can change it here.
     unsafe {
         if chdir(rootfs_c.as_ptr() as *const u8) != 0 {
             return Err(std::io::Error::new(
@@ -1219,12 +1021,72 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// The real work. Returns only on failure — success exits via execve. A
+// breakpoint (rd.break) pauses mid-hooks but then resumes, so it does not
+// change that contract.
+//
+// `shell_on_failure` is how the debug knobs reach the caller. It is set the
+// moment phase 1 reads the command line and is never unset, so a failure in
+// phases 5 to 7 — after `/proc` has been mount-moved into the new root and
+// `/proc/cmdline` no longer exists — is still answered by what the operator
+// actually asked for. Left `None` only when the boot failed before the read,
+// which is the one case the caller has to go and look for itself.
+fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
+    mount_virtual_filesystems()?;
+
+    // The cmdline becomes readable here and not before — main runs ahead of any
+    // mount. Quiet is read first so the banner and everything after it can
+    // honour it; the handful of lines before this point are unconditional
+    // because prelude cannot obey a preference it has not read.
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    init_quiet(&cmdline);
+    init_colour(&cmdline);
+
+    banner();
+
+    // Debug breakpoints, from the same read.
+    let breaks = Breakpoints::from_cmdline(&cmdline);
+    // And the answer to "open a shell if this boot fails?", banked now while
+    // the command line is still readable. Any rd.break implies rd.shell.
+    shell_on_failure.set(Some(cmdline_has(&cmdline, "rd.shell") || breaks.any()));
+
+    // Phase 2: figure out the target init.
+    let target_init = match cmdline_init() {
+        Some(v) => {
+            log(&format!("target init from cmdline: {v}"));
+            v
+        }
+        None => {
+            log("no init= on cmdline; will try fallback chain on the new root");
+            String::new()
+        }
+    };
+
+    // Phase 3: run the initramfs hooks. The kernel virtual filesystems
+    // are up — a hook may need them. prelude provides an empty /mnt/rootfs
+    // mountpoint; mounting a real root onto it is a hook's job (the root
+    // filesystem varies by deployment, so it is never hardcoded here).
+    // mkirf provides sequence order; runtime scheduling also respects capability
+    // declarations and deferred outcomes.
+    // /mnt may not exist in an initramfs whose base filesystem predates it.
+    try_mkdir("/mnt");
+    try_mkdir(ROOTFS);
+    run_hooks(&breaks)?;
+
+    handoff_root()?;
+    exec_target_init(&target_init)
+}
+
+fn exec_target_init(target_init: &str) -> std::io::Result<()> {
     // Phase 8: exec the real PID 1. Try cmdline init= first, then the
-    // Peios package-storage fallback chain. Root-level runtime views are not
-    // assumed to exist until the real init has started.
+    // fallback chain. These fallback names require the corresponding runtime
+    // paths to exist in the mounted root.
     let candidates: Vec<&str> = if !target_init.is_empty() {
         let mut v = Vec::with_capacity(FALLBACK_INITS.len() + 1);
-        v.push(target_init.as_str());
+        v.push(target_init);
         v.extend_from_slice(FALLBACK_INITS);
         v
     } else {
@@ -1243,6 +1105,8 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
         let pc = cstr(path);
         let arg0 = cstr(path);
         let argv: [*const u8; 2] = [arg0.as_ptr() as *const u8, core::ptr::null()];
+        // SAFETY: path and argument strings remain live, and both pointer
+        // arrays end in null. Successful exec replaces the entire process.
         unsafe {
             execve(pc.as_ptr() as *const u8, argv.as_ptr(), envp.as_ptr());
         }
@@ -1260,6 +1124,8 @@ fn boot(shell_on_failure: &Cell<Option<bool>>) -> std::io::Result<()> {
 
 fn halt() -> ! {
     log("halting system");
+    // SAFETY: these functions take no pointers, and RB_HALT_SYSTEM is the
+    // Linux halt command. If reboot fails, PID 1 remains alive below.
     unsafe {
         sync();
         reboot(RB_HALT_SYSTEM);
@@ -1288,8 +1154,7 @@ fn main() {
             // look identical to a halt with none set.
             None => match fs::read_to_string("/proc/cmdline") {
                 Ok(cmdline) => {
-                    cmdline_has(&cmdline, "rd.shell")
-                        || Breakpoints::from_cmdline(&cmdline).any()
+                    cmdline_has(&cmdline, "rd.shell") || Breakpoints::from_cmdline(&cmdline).any()
                 }
                 Err(err) => {
                     log_warn(&format!(
@@ -1572,7 +1437,7 @@ mod tests {
             .iter()
             .map(|n| (*n, format!("/system/prelude/hooks.seq.{n}")))
             .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.sort_by_key(|a| a.0);
         v
     }
 
@@ -1687,7 +1552,9 @@ mod tests {
         // did not run. Uncaught, the hook is vacuously ready and runs with no
         // diagnostic at all.
         let body = "hook /hooks/needy.sh\nrequires nobody-supplies-this\n";
-        let err = parse_hook_seq_v2("t", body.lines()).unwrap_err().to_string();
+        let err = parse_hook_seq_v2("t", body.lines())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("/hooks/needy.sh"), "{err}");
         assert!(err.contains("nobody-supplies-this"), "{err}");
         assert!(err.contains("which no hook provides"), "{err}");
@@ -1833,133 +1700,5 @@ mod tests {
         // number, so decoding it as an exit would report a status of 19.
         let reason = wait_failure((19 << 8) | 0x7f).expect("a stopped child must be a failure");
         assert_eq!(reason, "stopped");
-    }
-}
-
-#[cfg(test)]
-mod quiet_tests {
-    use super::{init_quiet, BLACKOUT};
-    use std::sync::atomic::Ordering;
-
-    /// Only level 2 reaches prelude. Levels 0 and 1 differ in whether peinit
-    /// may write into a terminal a service owns, and prelude exits before any
-    /// service exists — so neither changes anything here.
-    #[test]
-    fn only_level_two_blacks_prelude_out() {
-        for (cmdline, expected) in [
-            ("peios.quiet=2", true),
-            ("peios.quiet=1", false),
-            ("peios.quiet=0", false),
-            ("", false),
-            ("peios.quiet=", false),
-            ("peios.quiet=yes", false),
-            ("quiet", false),
-        ] {
-            init_quiet(cmdline);
-            assert_eq!(
-                BLACKOUT.load(Ordering::Relaxed),
-                expected,
-                "cmdline {cmdline:?}",
-            );
-        }
-    }
-
-    /// Last occurrence wins, matching the kernel's own handling of a repeated
-    /// parameter and peinit's parser.
-    #[test]
-    fn the_last_quiet_token_wins() {
-        init_quiet("peios.quiet=2 root=/dev/vda peios.quiet=0");
-        assert!(!BLACKOUT.load(Ordering::Relaxed));
-
-        init_quiet("peios.quiet=0 peios.quiet=2");
-        assert!(BLACKOUT.load(Ordering::Relaxed));
-
-        init_quiet("");
-    }
-}
-
-#[cfg(test)]
-mod format_tests {
-    use super::{banner_text, init_colour, render_with, Tag, BANNER_WIDTH, COLOUR};
-    use std::sync::atomic::Ordering;
-
-    // -----------------------------------------------------------------------
-    // The console line format.
-    //
-    // These assertions duplicate peinit's `console_style` tests on purpose. The
-    // format is shared by specification rather than by code (see the comment on
-    // the renderer), so the only thing keeping the two implementations honest is
-    // that both are held to the same expected strings. If you change a tag word
-    // or a width here, change it there.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn tag_words_render_inside_a_fixed_bracket() {
-        for (tag, expected) in [
-            (Tag::None, "[      ] "),
-            (Tag::Ok, "[  OK  ] "),
-            (Tag::Warn, "[ WARN ] "),
-            (Tag::Failed, "[FAILED] "),
-        ] {
-            let line = render_with(tag, "prelude", "x\n", false);
-            assert_eq!(line, format!("{expected}prelude: x\n"));
-        }
-    }
-
-    /// Colour must change the bytes and never the layout, so a serial log and a
-    /// VT agree about where the message starts.
-    #[test]
-    fn colour_does_not_move_the_column() {
-        let plain = render_with(Tag::Ok, "prelude", "x\n", false);
-        let coloured = render_with(Tag::Ok, "prelude", "x\n", true);
-        assert_ne!(plain, coloured);
-        let stripped: String = {
-            let mut out = String::new();
-            let mut chars = coloured.chars();
-            while let Some(c) = chars.next() {
-                if c == '\x1b' {
-                    for c in chars.by_ref() {
-                        if c == 'm' {
-                            break;
-                        }
-                    }
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        };
-        assert_eq!(stripped, plain);
-    }
-
-    #[test]
-    fn untagged_progress_is_never_coloured() {
-        assert!(!render_with(Tag::None, "prelude", "x\n", true).contains('\x1b'));
-    }
-
-    /// prelude's banner and peinit's must be the same width, or the pair reads
-    /// as two unrelated decorations rather than as one sequence.
-    #[test]
-    fn the_banner_is_a_fixed_width() {
-        let text = banner_text("prelude · initramfs · PID 1", "v0.0.1", false);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].is_empty() && lines[4].is_empty());
-        for line in &lines[1..4] {
-            assert_eq!(line.chars().count(), BANNER_WIDTH, "{line:?}");
-        }
-    }
-
-    #[test]
-    fn term_dumb_on_the_cmdline_disables_colour() {
-        let previous = COLOUR.load(Ordering::Relaxed);
-        init_colour("console=ttyS0 TERM=dumb loglevel=4");
-        assert!(!COLOUR.load(Ordering::Relaxed));
-        init_colour("console=ttyS0 loglevel=4");
-        assert!(COLOUR.load(Ordering::Relaxed));
-        // Last wins, as the kernel resolves a repeated parameter.
-        init_colour("TERM=linux TERM=dumb");
-        assert!(!COLOUR.load(Ordering::Relaxed));
-        COLOUR.store(previous, Ordering::Relaxed);
     }
 }
