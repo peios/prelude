@@ -1,36 +1,36 @@
-# prelude
+# Prelude
 
-The Peios initramfs subsystem — the boot stage between the kernel
-unpacking the initramfs and the real-root PID 1 taking over.
+Prelude is Peios's initramfs process 1. It mounts the kernel virtual
+filesystems, runs boot hooks, and hands control to the init on the mounted
+root. The repository also provides `seed-sd`, which initializes security
+descriptors, and a shell logging helper for boot hooks.
 
-A Cargo workspace:
+Both executables ship in one runtime package because they participate in the
+same early-boot lifecycle. The runtime binaries are static musl executables.
+The initramfs builder, `mkirf`, belongs to peiosutils; the real-root service
+supervisor, peinit, has its own repository.
 
-- **`crates/prelude`** — the initramfs PID 1. The kernel execs it as
-  `/init`; it gets userspace from "just unpacked into RAM" to "real root
-  mounted, real PID 1 running." See `crates/prelude/README.md`.
-**mkirf — the builder that compiles a directory tree into the
-deterministic initramfs `cpio.gz` the kernel loads — does not live here.**
-It ships as a `peiosutils` applet (`/usr/bin/mkirf` is a symlink into the
-multi-call binary), and its source is `peiosutils/src/uu/mkirf/`. A copy
-used to sit in this workspace and was removed once it became clear that
-the packaged one was the peiosutils applet, and that two copies of the
-hook-DAG resolver would drift.
+## Build and test
 
-That split matters when changing the `hooks.seq` format: mkirf writes it
-and prelude reads it, but they ship in two independently versioned
-packages, so an image can pair a new writer with an old reader.
+Bazel is the maintained build and packaging interface. Start with
+[Building Prelude](docs/building.md) to prepare the pinned static SDK,
+run tests, and produce PPK blobs and manifests. Cargo remains available for
+Rust editor integration and development checks.
 
-## Build
+Do not run the `prelude` executable on a development host. It changes mounts
+and roots, deletes the old initramfs, and halts on failure. Use the unit tests
+or a disposable boot environment. `seed-sd` changes access control and must
+only be run on deliberately selected targets.
 
-```
-make
-```
+## Documentation
 
-Builds the whole workspace for the `x86_64-unknown-linux-musl` target
-(static binaries). See the Makefile header for the NixOS toolchain note.
+- [Prelude architecture](docs/architecture.md) describes boot sequencing and
+  component boundaries.
+- [Learn](docs/learn/) contains the Peios initramfs-boot topic, merged into
+  Panorama's documentation tree.
+- [Manual pages](docs/man/) specify command-line and hook contracts.
+- [Coding style](docs/CODING_STYLE.md) records PSC adoption and exceptions.
+- [Archived recipes](docs/archive/pekit/) preserve the Pekit build inputs.
 
-## Design context
-
-`boot-design.md` in the parent `peios/` working tree sketches the
-boot-stack endgoal. Parts of it predate the current code — the crate
-docs describe what is actually true today.
+The repository is licensed under MIT. Dependency notices accompany the
+runtime and source packages; see [LICENSE](LICENSE) and `third-party/`.

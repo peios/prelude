@@ -1,0 +1,65 @@
+.TH SEED-SD 8 2026-10-19 "Peios prelude 0.0.7"
+.SH NAME
+seed-sd \- seed security descriptors on a filesystem tree
+.SH SYNOPSIS
+.B seed-sd
+.RB [ \-r | \-\-recursive ]
+.RB [ \-\-sddl " " \fIdescriptor\fR ]
+.RB [ \-\- ]
+.I path
+.SH DESCRIPTION
+.B seed-sd
+sets the owner, group, and discretionary access control list on a path.
+It initializes access control on newly mounted filesystems and device nodes.
+It stamps a symlink itself rather than following its target.
+.PP
+The default descriptor names SYSTEM as owner and group. Its DACL grants
+GenericAll to SYSTEM and Administrators, inheritable by objects and
+containers. A third entry grants GenericAll to CREATOR OWNER with object
+inheritance, container inheritance, and inherit-only set.
+.SH OPTIONS
+.TP
+.BR \-r , " " \-\-recursive
+Seed the path and each existing descendant. Each node is seeded before it is
+read, allowing traversal into a previously unmanaged directory. Symlinks are
+not descended into. A failed operation is reported and the walk continues
+where possible; changes already made are not rolled back.
+.TP
+.BI \-\-sddl " descriptor"
+Use this SDDL descriptor instead of the bootstrap default. The last supplied
+descriptor wins. Invalid input fails without falling back to the default.
+.TP
+.B \-\-
+End option parsing. Use this before a path beginning with a dash.
+.PP
+Exactly one path is required. Unknown options, a missing descriptor argument,
+extra paths, and arguments containing invalid UTF-8 are usage errors.
+Paths must be representable as UTF-8;
+recursive traversal reports unrepresentable descendant paths as failures.
+.SH SECURITY
+Replacing a missing descriptor requires SeRestorePrivilege. Updating an
+existing descriptor requires the applicable WRITE_DAC and WRITE_OWNER
+access. The kernel enforces these checks.
+.PP
+The bootstrap default grants nothing to Everyone. Broadening this default
+for /dev would also broaden access to inherited raw disk nodes. Supply a
+separate descriptor only when the target tree's policy requires it.
+.SH EXIT STATUS
+.TP
+.B 0
+Every requested operation succeeded.
+.TP
+.B 1
+Descriptor construction or at least one filesystem operation failed.
+.TP
+.B 2
+The command line is invalid.
+.SH EXAMPLES
+.B seed-sd -r /dev
+Seed existing device nodes and establish the default inherited descriptor
+for nodes created afterward.
+.PP
+.B seed-sd -- -data
+Seed a path whose name begins with a dash.
+.SH SEE ALSO
+.BR prelude (8)

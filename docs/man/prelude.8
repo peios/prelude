@@ -1,0 +1,97 @@
+.TH PRELUDE 8 2026-10-19 "Peios prelude 0.0.7"
+.SH NAME
+prelude \- prepare the initramfs and hand off to the real-root init
+.SH SYNOPSIS
+.B /init
+.SH DESCRIPTION
+.B prelude
+runs as process 1 in the initramfs. It mounts the kernel virtual filesystems,
+seeds device-node security descriptors, runs boot hooks, and switches to the
+root filesystem mounted by those hooks at
+.IR /mnt/rootfs .
+It then replaces itself with the real-root init.
+.PP
+Prelude is a boot entry point, not a command to start on a running system.
+Its mount changes and old-root cleanup affect the boot environment.
+.SH OPTIONS
+Prelude reads these parameters from
+.IR /proc/cmdline ,
+not from its process arguments.
+.TP
+.BI init= path
+Try this executable on the mounted root before the fallback chain.
+The last nonempty value wins. An unsuccessful exec proceeds to the next
+candidate. Fallbacks are /bin/peinit2, /sbin/init, /bin/init, and /bin/sh,
+in that order.
+.TP
+.B peios.quiet=2
+Suppress Prelude progress, success messages, and its banner after the command
+line has been read. Warnings and failures remain visible. The last value
+wins; other values do not suppress Prelude output. Hook output is independent.
+.TP
+.B rd.shell
+Open a recovery shell after a boot failure. Exiting that shell proceeds
+to the halt path.
+.TP
+.BR rd.break [ =\fIhook\fR [ ,\fIhook\fR ...]]
+Pause before reading the hook sequence, or before the named hooks.
+Names match a complete hook path or its final filename. Repeated parameters
+accumulate. Exiting the shell resumes boot; a deferred hook can reach the
+same named breakpoint again. Any breakpoint also enables the failure shell.
+.TP
+.B TERM=dumb
+Disable Prelude console color. The last TERM value wins; other values enable
+color. Executed hooks and init candidates receive TERM=linux independently.
+.SH SECURITY
+Prelude runs with the boot process's authority. Its hooks execute with that
+authority and can mount filesystems and change the environment before handoff.
+Control of hook files or recovery-shell access therefore grants control of
+boot. This component does not verify an image's signature.
+.PP
+Prelude invokes seed-sd recursively on /dev. Failure produces a warning and
+boot continues. See
+.BR seed-sd (8)
+for the descriptor and required access.
+.SH EXIT STATUS
+Successful handoff replaces the process and does not return. On failure,
+Prelude reports the error, optionally runs the recovery shell, synchronizes
+filesystems, and requests a system halt. If halt returns, process 1 parks
+instead of exiting.
+.SH ENVIRONMENT
+Hooks and the recovery shell receive PATH=/usr/bin and TERM=linux.
+Real-root init candidates receive TERM=linux, with no PATH supplied.
+.SH FILES
+.TP
+.I /system/prelude/hooks.seq.1
+Version 1 hook sequence.
+.TP
+.I /system/prelude/hooks.seq.2
+Version 2 hook sequence with runtime capability declarations.
+.TP
+.I /hooks.seq
+Legacy version 1 sequence, selected only when no supported numbered sequence
+is available.
+.TP
+.I /mnt/rootfs
+Mount point supplied for the real root. The mounted filesystem must provide
+proc, sys, and dev directories for the moved virtual filesystems.
+.TP
+.I /usr/bin/seed-sd
+Descriptor-seeding helper invoked before hooks.
+.TP
+.I /usr/bin/sh
+Recovery shell. This path must exist in the filesystem visible when recovery
+is entered, including after a root switch.
+.SH NOTES
+Prelude reads the highest supported sequence version and validates its
+first-line marker. A newer unsupported sequence alongside a supported one
+produces a warning. A missing sequence or an unsupported-only set fails boot.
+.PP
+Old-root cleanup removes entries on the original device and preserves other
+devices. Cleanup failure is a warning. Root handoff uses chroot rather than
+pivot_root; a different device identifier is required at /mnt/rootfs.
+.SH SEE ALSO
+.BR mkirf (1),
+.BR prelude-hooks (5),
+.BR peinit2 (8),
+.BR seed-sd (8)

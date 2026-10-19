@@ -1,0 +1,60 @@
+.TH PRELUDE-HOOKS 5 2026-10-19 "Peios prelude 0.0.7"
+.SH NAME
+prelude-hooks \- runtime hook sequences consumed by Prelude
+.SH SYNOPSIS
+.I /system/prelude/hooks.seq.1
+.br
+.I /system/prelude/hooks.seq.2
+.SH DESCRIPTION
+These files describe boot hooks selected and ordered by mkirf.
+Prelude 0.0.7 reads the highest available version it supports, through
+version 2. The first line must match the selected version.
+.PP
+Version 1 begins with "hookseq 1". Each subsequent nonempty line names a
+hook executable. Version 2 begins with "hookseq 2" and contains stanzas:
+.PP
+.nf
+hook /usr/libexec/prelude/hooks.d/mount-root
+provides root-mounted
+requires devices-ready
+after storage-probed
+.fi
+.PP
+A hook line starts a stanza. Its path must be nonempty. Subsequent provides,
+contributes, requires, and after lines contain whitespace-separated
+capability names. Repeated declarations append names. Empty lines are
+ignored. Unknown keys or a declaration before any hook are errors.
+Every required capability must have a provider or contributor in the sequence.
+An after declaration can name an absent capability.
+.PP
+A capability settles when all its providers and contributors have completed.
+It is achieved when settled and at least one provider succeeded, if providers
+exist. Contributors that decline count as complete. Requires waits for
+achievement; after waits only for settlement.
+.PP
+Hooks execute sequentially with direct console output. Exit 0 satisfies the
+hook, 69 declines it, and 75 defers it without completing it. A deferring hook
+promises that it has made no changes. Other exits and signal termination fail
+boot. Stopped hooks are killed, reaped, and reported as failures.
+.PP
+A deferred hook is retried on another pass after progress. A full pass with
+pending work and no completion fails instead of waiting indefinitely.
+.SH FILES
+.TP
+.I /hooks.seq
+Legacy version 1 sequence. Its marker is "hookseq 1".
+.TP
+.I /usr/libexec/prelude/hook-log.sh
+Sourced POSIX shell helper for console messages. Call hook_log_init with the
+component name, then use log, log_ok, log_skip, log_warn, or log_fail.
+Warnings and failures go to standard error; other messages go to standard
+output. Component names and messages are printed literally, including
+backslashes, regardless of color. TERM=dumb in /proc/cmdline disables color. The helper requires
+prelude-hook-abi level 3; it does not implement Prelude's quiet setting.
+.SH NOTES
+This is the runtime sequence format, not the source metadata block parsed by
+mkirf. The writer and reader are independently versioned. Changes to their
+shared format require coordinated compatibility review.
+.SH SEE ALSO
+.BR mkirf (1),
+.BR prelude (8)
