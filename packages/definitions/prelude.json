@@ -1,0 +1,40 @@
+{
+    "package": {
+        "name": "dev.peios.prelude",
+        "version": "0.0.7-1",
+        "architecture": "x86_64",
+        "license": "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense) AND ((Apache-2.0 OR MIT) AND MIT) AND ((MIT OR Apache-2.0) AND Unicode-3.0) AND (Apache-2.0 WITH LLVM-exception) AND MIT",
+        "license_class": "free",
+        "homepage": "https://github.com/peios/prelude",
+        "description": "Peios initramfs runtime, hook scheduler, and descriptor helper",
+        "default_root": "initramfs"
+    },
+    "files": {
+        "source:LICENSE": "usr/share/licenses/dev.peios.prelude/LICENSE",
+        "stage:licenses/**": "usr/share/licenses/dev.peios.prelude/third-party",
+        "stage:usr/sbin/prelude": "usr/sbin/prelude",
+        "stage:usr/bin/seed-sd": "usr/bin/seed-sd",
+        "stage:usr/libexec/prelude/hook-log.sh": "usr/libexec/prelude/hook-log.sh",
+        "stage:usr/share/man/man8/prelude.8.gz": "usr/share/man/man8/prelude.8.gz",
+        "stage:usr/share/man/man8/seed-sd.8.gz": "usr/share/man/man8/seed-sd.8.gz",
+        "stage:usr/share/man/man5/prelude-hooks.5.gz": "usr/share/man/man5/prelude-hooks.5.gz"
+    },
+    "dependencies": {
+        "sh": ">= 1"
+    },
+    "provides": {
+        "init": "1",
+        "prelude-hook-abi": "3"
+    },
+    "claims": {
+        "provides": {
+            "init": {
+                "bin": {
+                    "target": "/usr/sbin/prelude",
+                    "path": "/init"
+                }
+            }
+        }
+    },
+    "executables": ["usr/sbin/prelude", "usr/bin/seed-sd"]
+}

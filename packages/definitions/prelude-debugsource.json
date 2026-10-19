@@ -1,0 +1,19 @@
+{
+    "package": {
+        "name": "dev.peios.prelude-debugsource",
+        "version": "0.0.7-1",
+        "architecture": "noarch",
+        "license": "((MIT OR Apache-2.0) AND Unicode-3.0) AND Apache-2.0 AND (Apache-2.0 OR MIT) AND BSD-3-Clause AND ISC AND MIT AND (MIT OR Unlicense) AND ((Apache-2.0 OR MIT) AND MIT) AND ((MIT OR Apache-2.0) AND Unicode-3.0) AND (Apache-2.0 WITH LLVM-exception) AND MIT",
+        "license_class": "free",
+        "homepage": "https://github.com/peios/prelude",
+        "description": "Debug sources for Prelude and seed-sd"
+    },
+    "files": {
+        "source:LICENSE": "usr/share/licenses/dev.peios.prelude-debugsource/LICENSE",
+        "stage:licenses/**": "usr/share/licenses/dev.peios.prelude-debugsource/third-party",
+        "stage:usr/src/debug/**": "usr/src/debug"
+    },
+    "dependencies": {
+        "dev.peios.libpeios-debugsource": "= 0.5.12-1"
+    }
+}

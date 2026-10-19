@@ -1,2 +1,13 @@
 /target
 /out/
+
+# Rendered documentation and local tool caches.
+/docs/learn/dist/
+/docs/learn/.trail-cache/
+
+/bazel-*
+**/__pycache__/
+
+/.ci-sdk/
+/.ci-trail/
+/.ruff_cache/

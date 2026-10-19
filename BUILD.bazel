@@ -1,0 +1,125 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("//build:checks.bzl", "host_test")
+load("//build:version.bzl", "VERSION")
+load("//packages:package.bzl", "package_store")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+rust_binary(
+    name = "prelude",
+    srcs = glob(["crates/prelude/src/**/*.rs"]),
+    compile_data = [
+        "Cargo.toml",
+        "crates/prelude/Cargo.toml",
+        "LICENSE",
+    ],
+    crate_root = "crates/prelude/src/main.rs",
+    edition = "2021",
+    rustc_flags = ["-Cpanic=abort"],
+    version = VERSION,
+)
+
+rust_binary(
+    name = "seed-sd",
+    srcs = glob(["crates/seed-sd/src/**/*.rs"]),
+    compile_data = [
+        "Cargo.toml",
+        "crates/seed-sd/Cargo.toml",
+        "LICENSE",
+    ] + glob(["crates/seed-sd/tests/fixtures/**"]),
+    crate_root = "crates/seed-sd/src/main.rs",
+    edition = "2021",
+    rustc_flags = ["-Cpanic=abort"],
+    version = VERSION,
+    deps = ["@crates//:peios"],
+)
+
+rust_test(
+    name = "prelude-tests",
+    size = "small",
+    crate = ":prelude",
+)
+
+rust_test(
+    name = "seed-sd-tests",
+    size = "small",
+    crate = ":seed-sd",
+)
+
+host_test(
+    name = "hook-log-test",
+    size = "small",
+    command = "exec python3 tests/test_hook_log.py",
+    data = [
+        "src/hook-log.sh",
+        "tests/test_hook_log.py",
+    ],
+)
+
+filegroup(
+    name = "artifacts",
+    srcs = [
+        ":prelude",
+        ":seed-sd",
+    ],
+)
+
+filegroup(
+    name = "package-data",
+    srcs = [
+        "Cargo.lock",
+        "Cargo.toml",
+        "LICENSE",
+        "src/hook-log.sh",
+        "//packages:definitions",
+    ] + glob([
+        "crates/*/Cargo.toml",
+        "docs/man/*",
+        "third-party/**",
+    ]),
+)
+
+filegroup(
+    name = "package-sources",
+    srcs = glob(
+        [
+            "crates/**",
+            "src/**",
+            "tests/**",
+            "docs/**",
+            "third-party/**",
+            "*.toml",
+            "*.lock",
+            "*.md",
+            "MODULE.bazel*",
+            "BUILD.bazel",
+            "bazel",
+            "LICENSE",
+            ".bazel*",
+            ".gitignore",
+            ".cargo/**",
+            ".github/**",
+        ],
+        exclude = [
+            "**/__pycache__/**",
+            "docs/learn/dist/**",
+            "**/.trail-cache/**",
+            "*.pekit.toml",
+        ],
+    ) + [
+        "//build:sources",
+        "//packages:sources",
+        "//tools:sources",
+        "//vendor/ppk:sources",
+    ],
+)
+
+package_store(
+    name = "packages",
+    packages = ["//packages:all"],
+)
