@@ -63,6 +63,7 @@
 //
 // Exits 0 on success, 2 on usage error, 1 if any node could not be seeded.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -71,7 +72,15 @@ use peios::security::{
     AccessMask, AceFlags, AclBuilder, SdBuilder, SecurityDescriptor, Sid, WellKnown,
 };
 
-fn main() -> ExitCode {
+#[derive(Debug)]
+struct Options {
+    recursive: bool,
+    sddl: Option<String>,
+    path: String,
+}
+
+/// Validate the entire command line before constructing or applying a descriptor.
+fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, String> {
     let mut recursive = false;
     let mut sddl: Option<String> = None;
     let mut path: Option<String> = None;
@@ -79,12 +88,14 @@ fn main() -> ExitCode {
     // there would be no way to name a file that genuinely begins with a dash,
     // since an unrecognised one is now refused.
     let mut end_of_flags = false;
-    let mut args = std::env::args();
-    let prog = args.next().unwrap_or_else(|| "seed-sd".into());
-    while let Some(arg) = args.next() {
+    let mut args = args.into_iter();
+    while let Some(raw) = args.next() {
+        let arg = raw
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
         if end_of_flags {
             if path.is_some() {
-                return usage(&prog, &format!("more than one path, at {arg:?}"));
+                return Err(format!("more than one path, at {arg:?}"));
             }
             path = Some(arg);
             continue;
@@ -97,8 +108,14 @@ fn main() -> ExitCode {
             // caller asked for something else is the failure this whole flag
             // exists to make impossible.
             "--sddl" => match args.next() {
-                Some(value) => sddl = Some(value),
-                None => return usage(&prog, "--sddl needs a descriptor after it"),
+                Some(value) => {
+                    sddl = Some(
+                        value
+                            .into_string()
+                            .map_err(|_| "arguments must be valid UTF-8".to_string())?,
+                    )
+                }
+                None => return Err("--sddl needs a descriptor after it".to_string()),
             },
             // An unrecognised flag is a mistake, not a filename.
             //
@@ -109,21 +126,42 @@ fn main() -> ExitCode {
             // later. That is the failure the --sddl arm above already refuses
             // to risk; the same reasoning applies here.
             _ if arg.starts_with('-') => {
-                return usage(
-                    &prog,
-                    &format!(
-                        "unknown flag {arg:?} (put -- before a path that begins with a dash)"
-                    ),
-                )
+                return Err(format!(
+                    "unknown flag {arg:?} (put -- before a path that begins with a dash)"
+                ))
             }
             _ if path.is_none() => path = Some(arg),
-            _ => return usage(&prog, &format!("more than one path, at {arg:?}")),
+            _ => return Err(format!("more than one path, at {arg:?}")),
         }
     }
     let Some(path) = path else {
-        return usage(&prog, "no path given");
+        return Err("no path given".to_string());
     };
 
+    Ok(Options {
+        recursive,
+        sddl,
+        path,
+    })
+}
+
+fn main() -> ExitCode {
+    let mut args = std::env::args_os();
+    let program = args.next().unwrap_or_else(|| "seed-sd".into());
+    let options = match parse_options(args) {
+        Ok(options) => options,
+        Err(problem) => return usage(&program.to_string_lossy(), &problem),
+    };
+    seed(options)
+}
+
+fn seed(
+    Options {
+        recursive,
+        sddl,
+        path,
+    }: Options,
+) -> ExitCode {
     let sd = match build_sd(sddl.as_deref()) {
         Ok(sd) => sd,
         Err(e) => {
@@ -314,7 +352,44 @@ fn seed_recursive(path: &str, sd: &SecurityDescriptor) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_sd, build_seed_sd, Sid, WellKnown};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::{build_sd, build_seed_sd, parse_options, Sid, WellKnown};
+
+    #[test]
+    fn invalid_utf8_is_a_usage_error_before_any_path_is_seeded() {
+        let invalid = OsString::from_vec(vec![0xff]);
+        for args in [
+            vec![invalid.clone()],
+            vec!["--sddl".into(), invalid.clone(), "/dev".into()],
+            vec!["--".into(), invalid],
+        ] {
+            assert_eq!(
+                parse_options(args).unwrap_err(),
+                "arguments must be valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn command_line_keeps_flags_and_literal_paths_distinct() {
+        let options = parse_options(
+            ["-r", "--sddl", "first", "--sddl", "last", "--", "-data"].map(OsString::from),
+        )
+        .unwrap();
+        assert!(options.recursive);
+        assert_eq!(options.sddl.as_deref(), Some("last"));
+        assert_eq!(options.path, "-data");
+        for args in [
+            vec![],
+            vec!["--sddl"],
+            vec!["--recursiv", "/dev"],
+            vec!["first", "second"],
+        ] {
+            assert!(parse_options(args.into_iter().map(OsString::from)).is_err());
+        }
+    }
 
     #[test]
     fn default_descriptor_matches_original_builder_bytes() {
