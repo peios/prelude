@@ -1,0 +1,53 @@
+{
+    "format": 1,
+    "component": "prelude",
+    "origin": {
+        "repository": "https://github.com/peios/integration-tests.git",
+        "commit": "a9aeaa2d6255bf59034ac5d90bee871a0d4829be"
+    },
+    "files": {
+        "profiles/prelude/fixtures/pt-hook.sh": "profiles/prelude/fixtures/pt-hook.sh",
+        "profiles/prelude/hooks/pt-late.sh": "profiles/prelude/hooks/pt-late.sh",
+        "profiles/prelude/hooks/pt-mount-root.sh": "profiles/prelude/hooks/pt-mount-root.sh",
+        "profiles/prelude/hooks/pt-topology.sh": "profiles/prelude/hooks/pt-topology.sh",
+        "tests/helpers/prelude.lua": "tests/helpers/prelude.lua",
+        "tests/prelude/breakpoints.test.lua": "tests/prelude/breakpoints.test.lua",
+        "tests/prelude/capabilities.test.lua": "tests/prelude/capabilities.test.lua",
+        "tests/prelude/handoff.test.lua": "tests/prelude/handoff.test.lua",
+        "tests/prelude/harness.test.lua": "tests/prelude/harness.test.lua",
+        "tests/prelude/hook-contract.test.lua": "tests/prelude/hook-contract.test.lua",
+        "tests/prelude/init-selection.test.lua": "tests/prelude/init-selection.test.lua",
+        "tests/prelude/mkirf-hooks.test.lua": "tests/prelude/mkirf-hooks.test.lua",
+        "tests/prelude/mkirf-sequence.test.lua": "tests/prelude/mkirf-sequence.test.lua",
+        "tests/prelude/scheduler.test.lua": "tests/prelude/scheduler.test.lua",
+        "tests/prelude/sequence.test.lua": "tests/prelude/sequence.test.lua",
+        "tests/prelude/smoke.test.lua": "tests/prelude/smoke.test.lua",
+        "tests/prelude/startup-cmdline.test.lua": "tests/prelude/startup-cmdline.test.lua",
+        "tests/prelude/startup.test.lua": "tests/prelude/startup.test.lua",
+        "tests/seed-sd/cli.test.lua": "tests/seed-sd/cli.test.lua",
+        "tests/seed-sd/descriptor.test.lua": "tests/seed-sd/descriptor.test.lua",
+        "tests/seed-sd/inheritance.test.lua": "tests/seed-sd/inheritance.test.lua",
+        "tests/seed-sd/stamp.test.lua": "tests/seed-sd/stamp.test.lua",
+        "tests/seed-sd/walk.test.lua": "tests/seed-sd/walk.test.lua"
+    },
+    "tests": [
+        "tests/prelude/breakpoints.test.lua",
+        "tests/prelude/capabilities.test.lua",
+        "tests/prelude/handoff.test.lua",
+        "tests/prelude/harness.test.lua",
+        "tests/prelude/hook-contract.test.lua",
+        "tests/prelude/init-selection.test.lua",
+        "tests/prelude/mkirf-hooks.test.lua",
+        "tests/prelude/mkirf-sequence.test.lua",
+        "tests/prelude/scheduler.test.lua",
+        "tests/prelude/sequence.test.lua",
+        "tests/prelude/smoke.test.lua",
+        "tests/prelude/startup-cmdline.test.lua",
+        "tests/prelude/startup.test.lua",
+        "tests/seed-sd/cli.test.lua",
+        "tests/seed-sd/descriptor.test.lua",
+        "tests/seed-sd/inheritance.test.lua",
+        "tests/seed-sd/stamp.test.lua",
+        "tests/seed-sd/walk.test.lua"
+    ]
+}
