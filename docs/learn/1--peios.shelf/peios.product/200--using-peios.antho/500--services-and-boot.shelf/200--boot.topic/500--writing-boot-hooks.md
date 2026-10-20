@@ -18,7 +18,7 @@ Put service startup and ongoing supervision in Peinit instead.
 
 Hooks run under the bootstrap SYSTEM token. That authority does not remove
 kernel access checks or replace the security descriptors needed during boot.
-See [Prelude](~peios/using-peios/initramfs-boot/prelude) for the stage's
+See [Prelude](~peios/boot/prelude) for the stage's
 responsibilities and handoff checks.
 
 ## Choose a location and declare dependencies
@@ -148,6 +148,6 @@ is an error; an intentionally empty manifest is distinct from a missing one.
 Malformed selected manifests also fail rather than silently rescanning hooks.
 
 For discovery and dependency validation during image construction, see
-[Building an Initial RAM Filesystem](https://learn.peios.org/peios/using-peios/boot-images/mkirf/).
+[Building an Initial RAM Filesystem](https://learn.peios.org/peios/using-peios/boot/mkirf/).
 A successful archive build does not establish that its tools, policy, or
 storage configuration can boot.

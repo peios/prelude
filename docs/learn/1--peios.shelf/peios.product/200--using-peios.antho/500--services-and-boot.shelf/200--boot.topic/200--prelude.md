@@ -88,4 +88,4 @@ the supplied image decides which candidates and tools exist.
 ## Authoring hooks
 
 For capability declarations, runtime outcomes, and console reporting, read
-[Writing Boot Hooks](~peios/using-peios/initramfs-boot/writing-boot-hooks).
+[Writing Boot Hooks](~peios/boot/writing-boot-hooks).
