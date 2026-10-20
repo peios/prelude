@@ -27,7 +27,7 @@ only be run on deliberately selected targets.
 - [Prelude architecture](docs/architecture.md) describes boot sequencing and
   component boundaries.
 - [Learn](docs/learn/) contains the Peios initramfs-boot topic, merged into
-  Panorama's documentation tree.
+  Peios Learn.
 - [Manual pages](docs/man/) specify command-line and hook contracts.
 - [Coding style](docs/CODING_STYLE.md) records PSC adoption and exceptions.
 - [Archived recipes](docs/archive/pekit/) preserve the Pekit build inputs.
