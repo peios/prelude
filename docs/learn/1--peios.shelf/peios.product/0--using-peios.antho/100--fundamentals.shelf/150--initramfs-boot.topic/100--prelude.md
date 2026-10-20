@@ -56,3 +56,36 @@ A failure to seed device descriptors produces a warning and boot continues.
 A hook failure or missing real root stops the handoff. Those outcomes need
 different responses; a completed boot does not prove every device received
 its intended descriptor.
+
+## Assembling and updating the temporary root
+
+The conventional source tree is `/boot/initramfs`. It must contain Prelude,
+its interpreter and helper dependencies, the hook sequence, and the drivers
+needed to reach the target root. The `mkirf` build resolves hook ordering;
+Prelude consumes that result. An ordinary source-tree edit does not change an
+already-built initramfs or UKI. Rebuild the artifact, deploy it through the
+image's boot workflow, and verify which artifact the next boot actually loads.
+
+The temporary root is independent of the installed root. A helper available
+under the installed `/usr` is not thereby available before handoff. Include
+its dynamic loader and libraries, or use an appropriate static build. Do not
+assume runtime `/bin` and `/lib` views exist before their topology hook runs.
+
+Module availability, dependency closure, loading, and root readiness are
+separate checks. Include modules matching the booted kernel and their
+required providers. A package-supplied coldplug hook can scan modaliases in a
+bounded settling window; Prelude itself is not a hotplug manager. A module
+loading failure matters according to whether a later hook can still prepare
+the root. Hardware that appears after that window needs the real-root device
+manager or an explicit boot design.
+
+For storage changes, preserve a known bootable artifact and test the intended
+hardware or recorded VM image. Do not infer that every firmware-dependent or
+network-root configuration fits a generic storage-only module set. The exact
+init selection, fallback paths, and root-switch behavior are in `prelude(8)`;
+the supplied image decides which candidates and tools exist.
+
+## Authoring hooks
+
+For capability declarations, runtime outcomes, and console reporting, read
+[Writing Boot Hooks](~peios/using-peios/initramfs-boot/writing-boot-hooks).
