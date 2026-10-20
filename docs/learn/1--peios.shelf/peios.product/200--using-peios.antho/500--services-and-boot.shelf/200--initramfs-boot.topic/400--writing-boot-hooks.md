@@ -148,6 +148,6 @@ is an error; an intentionally empty manifest is distinct from a missing one.
 Malformed selected manifests also fail rather than silently rescanning hooks.
 
 For discovery and dependency validation during image construction, see
-[Building an Initial RAM Filesystem](https://learn.peios.org/peios/using-peios/peiosutils/boot-images/mkirf/).
+[Building an Initial RAM Filesystem](https://learn.peios.org/peios/using-peios/boot-images/mkirf/).
 A successful archive build does not establish that its tools, policy, or
 storage configuration can boot.
