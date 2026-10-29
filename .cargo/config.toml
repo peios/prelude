@@ -1,5 +1,5 @@
-# Bazel is the canonical build interface. Cargo remains available for focused
-# development with an explicitly selected compatible static Peios SDK.
+# pekit is the canonical build interface. Cargo remains available for
+# editor integration and focused development against a static musl SDK.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static"]

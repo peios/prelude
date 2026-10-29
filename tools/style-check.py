@@ -27,51 +27,24 @@ def tool(name: str, version: str) -> str:
 def main() -> None:
     python = [
         str(p.relative_to(ROOT))
-        for folder in ("tools", "packages", "tests")
+        for folder in ("tools", "tests")
         for p in sorted((ROOT / folder).glob("*.py"))
     ]
     ruff = tool("ruff", "ruff 0.17.0")
     run([ruff, "check", "--no-cache", "--config", "tools/ruff.toml", *python])
     run([ruff, "format", "--check", "--no-cache", "--config", "tools/ruff.toml", *python])
-    shell = ["bazel", "tools/check", "tools/offline-build", "src/hook-log.sh"]
+    shell = ["tools/check", "src/hook-log.sh"]
     run([tool("shellcheck", "version: 0.11.0"), *shell])
     run([tool("shfmt", "v3.14.1"), "-d", "-i", "4", *shell])
-    starlark = ["BUILD.bazel", "MODULE.bazel", "vendor/ppk/BUILD.bazel"] + [
-        str(p.relative_to(ROOT))
-        for folder in ("build", "packages", "tools")
-        for p in sorted((ROOT / folder).rglob("*"))
-        if p.name == "BUILD.bazel" or p.suffix == ".bzl"
-    ]
-    run(
-        [
-            tool("buildifier", "buildifier version: 10.1.0"),
-            "-mode=check",
-            "-lint=warn",
-            "-warnings=load,unused-variable,function-docstring",
-            *starlark,
-        ]
-    )
     data = [
         str(p.relative_to(ROOT))
-        for folder in ("packages", ".github")
+        for folder in (".github",)
         for p in sorted((ROOT / folder).rglob("*"))
         if p.suffix in {".json", ".yml"}
     ]
     if data:
         run([tool("prettier", "3.9.10"), "--config", "tools/prettier.json", "--check", *data])
     run(["cargo", "+1.98.1", "fmt", "--all", "--", "--check"])
-    run(
-        [
-            "rustup",
-            "run",
-            "1.98.1",
-            "rustfmt",
-            "--check",
-            "--config-path",
-            "rustfmt.toml",
-            "packages/check_blobs.rs",
-        ]
-    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+#!/bin/sh
+# The contributor check: owned source style, then pekit's tests, which build
+# both programs, run their unit tests and the hook logger's test, and check
+# them with Clippy. No test runs PID 1 or seeds descriptors on host files.
+set -eu
+
+repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+python3 tools/style-check.py
+pekit test

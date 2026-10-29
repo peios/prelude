@@ -1,0 +1,48 @@
+# prelude's tests: each program's unit tests, as `cargo test -p` builds
+# them, Clippy's checks, as `cargo clippy --all-targets -- -Dwarnings` makes
+# them, and the hook logger's test.
+#
+# A test's own code runs in a hermetic step of its own, so what it plans,
+# builds or fetches is in its parameters' defaults.
+import fs
+import toolchain
+import Toolchain from toolchain
+import BuildEnv from "github.com/gcslib/buildenv"
+import "github.com/gcslib/python"
+import "github.com/gcslib/rust"
+
+# The members of the workspace, each a directory of `crates/`.
+let MEMBERS = ["prelude", "seed-sd"]
+
+def test prelude(tests: List<rust.RustTest> = rust.tests(crates(), "prelude")) {
+    let each = for test in tests { = rust.run_test(test) }
+}
+
+def test seed_sd(tests: List<rust.RustTest> = rust.tests(crates(), "seed-sd")) {
+    let each = for test in tests { = rust.run_test(test) }
+}
+
+# Clippy's checks of each member, every warning denied.
+def test clippy(checked: List<List<{}>> = for each in MEMBERS { = rust.clippy(crates(), each, flags = ["-Dwarnings"]) }) {}
+
+# The hook logger, `src/hook-log.sh`, sourced by busybox's `sh`: its
+# messages stay literal, and each status keeps its stream and layout, as
+# `tests/test_hook_log.py` checks.
+def test hook_log(
+    sources: List<{at: String, place: Dir | File}> = [
+        {at = "/work/src/hook-log.sh"; place = file("src/hook-log.sh")},
+        {at = "/work/tests/test_hook_log.py"; place = file("tests/test_hook_log.py")},
+    ],
+    c: toolchain.CToolchain = toolchain.get(Toolchain::C),
+    py: python.PythonToolchain = toolchain.get(Toolchain::Python),
+    env: BuildEnv = toolchain.get(Toolchain::BuildEnv),
+) {
+    let placed: List<{at: String, place: Dir | File | FileSet}> = [
+        {at = "/"; place = c.runtime},
+        {at = "/bin"; place = env.root.dir("bin")},
+        {at = "/opt/python"; place = py.root},
+        ...(for each in sources { = {at = each.at; place = each.place} }),
+    ]
+    let box = fs.compose(placed).sandbox(cwd = "/work", env = {PYTHONDONTWRITEBYTECODE = "1"})
+    let ran = box.exec("/opt/python/bin/python3", "/work/tests/test_hook_log.py")
+}

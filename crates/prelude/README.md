@@ -9,5 +9,5 @@ See [the repository overview](../../README.md),
 [build instructions](../../docs/building.md). The maintained command and
 hook references are in [docs/man](../../docs/man/).
 
-Run unit tests through Bazel. Do not execute this crate's main program on
+Run unit tests with `pekit test`. Do not execute this crate's main program on
 the development host.
