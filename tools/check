@@ -1,16 +1,10 @@
 #!/bin/sh
-# Check ordinary Linux behavior without executing PID 1 or seeding host files.
+# The contributor check: owned source style, then pekit's tests, which build
+# both programs, run their unit tests and the hook logger's test, and check
+# them with Clippy. No test runs PID 1 or seeds descriptors on host files.
 set -eu
+
 repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
-: "${PEIOS_SDK:?Set PEIOS_SDK to a prepared GNU development SDK}"
-[ "$(cat "$PEIOS_SDK/TARGET")" = x86_64-unknown-linux-gnu ] || {
-    echo "tools/check requires a GNU SDK; use Bazel --config=musl for static builds" >&2
-    exit 1
-}
 python3 tools/style-check.py
-./bazel test //...
-export PEIOS_LIB_DIR="$PEIOS_SDK/lib" PEIOS_INCLUDE="$PEIOS_SDK/include" PKM_UAPI="$PEIOS_SDK/include"
-gcc_include=$(cc -print-file-name=include)
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem $gcc_include${BINDGEN_EXTRA_CLANG_ARGS:+ $BINDGEN_EXTRA_CLANG_ARGS}"
-cargo +1.98.1 clippy --workspace --all-targets --locked --no-deps -- -D warnings
+pekit test

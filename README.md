@@ -12,10 +12,9 @@ supervisor, peinit, has its own repository.
 
 ## Build and test
 
-Bazel is the maintained build and packaging interface. Start with
-[Building Prelude](docs/building.md) to prepare the pinned static SDK,
-run tests, and produce PPK blobs and manifests. Cargo remains available for
-Rust editor integration and development checks.
+Pekit builds and tests both programs. Start with
+[Building Prelude](docs/building.md). Cargo remains available for Rust
+editor integration and development checks.
 
 Do not run the `prelude` executable on a development host. It changes mounts
 and roots, deletes the old initramfs, and halts on failure. Use the unit tests

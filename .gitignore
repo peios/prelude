@@ -1,13 +1,14 @@
 /target
-/out/
 
 # Rendered documentation and local tool caches.
 /docs/learn/dist/
 /docs/learn/.trail-cache/
 
-/bazel-*
 **/__pycache__/
-
-/.ci-sdk/
-/.ci-trail/
 /.ruff_cache/
+
+# pekit build output.
+/pekit-out/
+
+# Libraries pekit fetches for the pins in `pekit.lock`.
+/.gcsl/

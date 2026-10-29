@@ -1,6 +1,6 @@
 # Prelude Coding Style
 
-Follow PSC's common rules and Rust, shell, Python, and Bazel profiles.
+Follow PSC's common rules and Rust, shell, and Python profiles.
 Use four spaces and a 100-column Rust formatter target. Keep the selected
 Rust edition and formatter pinned in the build configuration.
 

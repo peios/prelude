@@ -1,0 +1,31 @@
+# prelude's programs, each crate compiled on its own (see the rust
+# library's `workspace`): static, position-independent musl programs,
+# which an initramfs runs before any C library is there.
+import "github.com/gcslib/clang"
+import "github.com/gcslib/rust"
+import "github.com/peios/peios-rs" as peios_rs
+
+# The prelude workspace, planned for musl, every program linked with full
+# RELRO. seed-sd links libpeios's static archive for musl, which
+# peios-rs's library gives `peios-sys`.
+def crates() -> rust.RustWorkspace {
+    let target = "x86_64-unknown-linux-musl"
+    = rust.workspace(
+        dir("."),
+        rust.vendored(file("Cargo.lock")),
+        target = target,
+        rustflags = [...rust.default_rustflags(target), "-Clink-arg=-Wl,-z,relro", "-Clink-arg=-Wl,-z,now"],
+        crates = peios_rs.static_musl_crate_settings(),
+        libclang = [clang.libclang_18()],
+    )
+}
+
+# The initramfs's PID 1.
+def build prelude() {
+    = rust.bin(crates(), "prelude")
+}
+
+# The tool that seeds bootstrap security descriptors on initramfs paths.
+def build seed_sd() {
+    = rust.bin(crates(), "seed-sd")
+}
