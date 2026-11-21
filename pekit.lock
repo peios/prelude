@@ -83,15 +83,15 @@
       "path": "github.com/peios/peios-rs",
       "git": "https://github.com/peios/peios-rs",
       "dir": "",
-      "commit": "4c9c0106550e3b7d8b4a98dfd0d7a5490fcf0116",
-      "tree": "3e352c4a1a6191f9a9ffae40eb692e68ce9fd766b077f79a800233f8c30c2e6a"
+      "commit": "623520bc0405fdd4526bab45f45882e7f19b1ab1",
+      "tree": "e1f418600c8c3d6ae17dbbccb36c69c95d3cfc18a9796c4bbd5783413f9c585a"
     },
     {
       "path": "github.com/peios/peios-sdk",
       "git": "https://github.com/peios/peios-sdk",
       "dir": "",
-      "commit": "e4e5fc7729aaf0c48ce3c17cd01db5bb46c747f4",
-      "tree": "a99ee01e1c461f1110dd3aa2252005de09657ffc08d4058d3782c858dafe69f0"
+      "commit": "712be642734adf2b97df11096075c3fa901857c1",
+      "tree": "c832dfc3818cd9540785c58a741d8610c7c8f69b38f26fc9650244b1b727e2e5"
     }
   ]
 }
